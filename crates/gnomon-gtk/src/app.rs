@@ -23,6 +23,13 @@ pub fn run(toplevel: bool) -> glib::ExitCode {
 
 fn load_css() {
     let provider = gtk::CssProvider::new();
+
+    // A dropped declaration is otherwise silent, which is exactly how the
+    // transparent-panel defect stayed invisible.
+    provider.connect_parsing_error(|_, section, error| {
+        eprintln!("gnomon: CSS error at {section}: {error}");
+    });
+
     provider.load_from_string(STYLE);
 
     if let Some(display) = gdk::Display::default() {
@@ -44,6 +51,9 @@ fn build_window(app: &adw::Application, toplevel: bool) {
         .build();
 
     if !toplevel {
+        // Scopes the transparency rule, so --toplevel keeps a solid window.
+        win.add_css_class("gnomon-layer");
+
         // All of this must happen before the window is realized.
         win.init_layer_shell();
         win.set_layer(Layer::Overlay);

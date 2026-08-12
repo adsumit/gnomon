@@ -1,11 +1,28 @@
-window {
-  background: transparent;
+/* Only the layer surface is transparent. A --toplevel window keeps its normal
+   decorated background. libadwaita puts the .background style class on the
+   window, which outranks a bare `window` element selector, so target both. */
+window.gnomon-layer,
+window.gnomon-layer.background {
+  background-color: transparent;
 }
 
 #root {
-  background: @window_bg_color;
-  border: 1px solid @borders;
+  /* Declared three times on purpose, weakest first. A declaration whose value
+     fails to parse or resolve is dropped individually, so whichever of these
+     survives wins. The literal is an opaque last resort: a see-through panel is
+     worse than one that ignores the theme. */
+  background-color: #242424;
+  background-color: @window_bg_color;
+  background-color: var(--window-bg-color);
+
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-color: @borders;
+  border-color: var(--borders);
+
   border-radius: 16px;
+
+  /* Padding, not margin: the inset must sit inside the rounded background. */
+  padding: 16px;
 }
 
 progressbar trough,
@@ -15,13 +32,16 @@ progressbar progress {
 }
 
 progressbar.sev-normal progress {
-  background: @accent_bg_color;
+  background-color: @accent_bg_color;
+  background-color: var(--accent-bg-color);
 }
 
 progressbar.sev-warning progress {
-  background: @warning_bg_color;
+  background-color: @warning_bg_color;
+  background-color: var(--warning-bg-color);
 }
 
 progressbar.sev-error progress {
-  background: @error_bg_color;
+  background-color: @error_bg_color;
+  background-color: var(--error-bg-color);
 }

@@ -53,6 +53,8 @@ pub fn build() -> gtk::Box {
     // Something to look at before the first snapshot lands.
     render(&root, &status, &state);
 
+    debug_css_on_realize(&root);
+
     let (tx, rx) = async_channel::unbounded::<Update>();
     feed::spawn(tx);
 
@@ -93,6 +95,49 @@ pub fn build() -> gtk::Box {
     }
 
     root
+}
+
+/// Named colours the panel depends on.
+const PROBED_COLORS: [&str; 5] = [
+    "window_bg_color",
+    "borders",
+    "accent_bg_color",
+    "warning_bg_color",
+    "error_bg_color",
+];
+
+/// With `GNOMON_DEBUG_CSS` set, report once whether the themed colours resolve.
+///
+/// GTK 4 exposes no public getter for a widget's *computed* background, so this
+/// asks the style context to resolve each named colour instead — which is the
+/// question that actually matters: an unresolvable name means the declaration
+/// using it was dropped and the panel fell back to the literal. `lookup_color`
+/// is deprecated in GTK 4.10 but still functional, and is the only route to
+/// this answer without a private API.
+fn debug_css_on_realize(root: &gtk::Box) {
+    if std::env::var_os("GNOMON_DEBUG_CSS").is_none() {
+        return;
+    }
+
+    root.connect_realize(|widget| {
+        #[allow(deprecated)]
+        let ctx = widget.style_context();
+
+        for name in PROBED_COLORS {
+            #[allow(deprecated)]
+            match ctx.lookup_color(name) {
+                Some(c) => eprintln!(
+                    "gnomon: @{name} resolves to rgba({:.3}, {:.3}, {:.3}, {:.3}){}",
+                    c.red(),
+                    c.green(),
+                    c.blue(),
+                    c.alpha(),
+                    if c.alpha() < 1.0 { "  <-- NOT OPAQUE" } else { "" }
+                ),
+                None => eprintln!("gnomon: @{name} DID NOT RESOLVE (declaration dropped)"),
+            }
+        }
+    });
 }
 
 /// Store a snapshot. Returns true when the screen needs rebuilding.
