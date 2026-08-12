@@ -7,6 +7,8 @@ use gtk::glib;
 
 mod app;
 mod feed;
+mod geom;
+mod pin;
 mod window;
 
 /// Width the kind label is padded to in human-readable output.
@@ -20,6 +22,7 @@ USAGE:
     gnomon --toplevel      launch as an ordinary window instead
     gnomon --once          fetch once and print each limit window
     gnomon --once --json   fetch once and print the snapshot as JSON
+    gnomon --toggle-pin    toggle click-through on the running meter
     gnomon --help          show this message
 
 EXIT CODES:
@@ -34,6 +37,10 @@ fn main() -> ExitCode {
     if flags.iter().any(|f| *f == "--help" || *f == "-h") {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
+    }
+
+    if flags.contains(&"--toggle-pin") {
+        return toggle_pin();
     }
 
     let once = flags.contains(&"--once");
@@ -77,6 +84,41 @@ fn main() -> ExitCode {
         }
         Err(e) => report(&e),
     }
+}
+
+/// Signal the running meter to flip its pin state.
+///
+/// A pinned panel is click-through, so it cannot be clicked to unpin itself —
+/// hence a signal rather than a widget.
+fn toggle_pin() -> ExitCode {
+    let Some(path) = pin::pid_path() else {
+        eprintln!("gnomon: cannot determine the runtime directory");
+        return ExitCode::from(1);
+    };
+
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        eprintln!("gnomon: no running meter (no pid file at {})", path.display());
+        return ExitCode::from(1);
+    };
+
+    let Ok(pid) = text.trim().parse::<i32>() else {
+        eprintln!("gnomon: pid file at {} is not a pid", path.display());
+        return ExitCode::from(1);
+    };
+
+    if !pin::is_alive(pid) {
+        eprintln!("gnomon: no running meter (stale pid {pid})");
+        return ExitCode::from(1);
+    }
+
+    // SAFETY: delivering SIGUSR1 to a pid we just confirmed exists.
+    if unsafe { libc::kill(pid, libc::SIGUSR1) } != 0 {
+        eprintln!("gnomon: could not signal pid {pid}");
+        return ExitCode::from(1);
+    }
+
+    println!("gnomon: sent SIGUSR1 to pid {pid} — pin toggled");
+    ExitCode::SUCCESS
 }
 
 /// Print the error and choose an exit code. Never prints a token.

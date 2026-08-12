@@ -1,16 +1,20 @@
 //! Widget tree and update handling. Every call here runs on the main thread.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use chrono::{DateTime, Utc};
+use gnomon_core::{LimitWindow, UsageSnapshot};
 use gtk::glib;
 use gtk::prelude::*;
-use gnomon_core::{LimitWindow, UsageSnapshot};
 
 use crate::feed::{self, Update};
 
 const SEVERITY_CLASSES: [&str; 3] = ["sev-normal", "sev-warning", "sev-error"];
+/// Below this width the panel drops the countdowns and the decimal place.
+const COMPACT_WIDTH: i32 = 240;
+/// Edge length of the resize grip.
+const GRIP_SIZE: i32 = 16;
 
 /// One rendered limit window, kept so the countdown can tick without a rebuild.
 struct Row {
@@ -23,10 +27,17 @@ struct State {
     windows: Vec<LimitWindow>,
     rows: Vec<Row>,
     loaded: bool,
+    compact: bool,
+}
+
+/// The pieces app.rs needs to wire up interaction.
+pub struct Content {
+    pub root: gtk::Box,
+    pub grip: gtk::DrawingArea,
 }
 
 /// Build the content tree, start the feed, and wire up updates.
-pub fn build() -> gtk::Box {
+pub fn build() -> Content {
     let root = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(14)
@@ -44,16 +55,23 @@ pub fn build() -> gtk::Box {
         .build();
     status.add_css_class("dim-label");
 
+    let grip = gtk::DrawingArea::builder()
+        .content_width(GRIP_SIZE)
+        .content_height(GRIP_SIZE)
+        .halign(gtk::Align::End)
+        .build();
+    grip.set_widget_name("grip");
+
     let state = Rc::new(RefCell::new(State {
         windows: Vec::new(),
         rows: Vec::new(),
         loaded: false,
+        compact: false,
     }));
 
-    // Something to look at before the first snapshot lands.
-    render(&root, &status, &state);
-
+    render(&root, &status, &grip, &state);
     debug_css_on_realize(&root);
+    watch_width(&root, &status, &grip, &state);
 
     let (tx, rx) = async_channel::unbounded::<Update>();
     feed::spawn(tx);
@@ -61,13 +79,14 @@ pub fn build() -> gtk::Box {
     {
         let root = root.clone();
         let status = status.clone();
+        let grip = grip.clone();
         let state = state.clone();
         glib::spawn_future_local(async move {
             while let Ok(update) = rx.recv().await {
                 match update {
                     Update::Snapshot(snapshot, _origin) => {
                         if apply(&state, snapshot) {
-                            render(&root, &status, &state);
+                            render(&root, &status, &grip, &state);
                         } else {
                             // Payload unchanged: clear any stale error without
                             // rebuilding the bars.
@@ -94,7 +113,43 @@ pub fn build() -> gtk::Box {
         });
     }
 
-    root
+    Content { root, grip }
+}
+
+/// Track the panel's width from its allocation, not from a timer.
+///
+/// GTK 4 removed the consumer-facing `size-allocate` signal, and `GtkWidget`
+/// exposes no notifiable width property. A zero-height `GtkDrawingArea` that
+/// spans the row does have a `resize` signal, and it fires on allocation — so
+/// it serves as an allocation probe without drawing anything.
+fn watch_width(
+    root: &gtk::Box,
+    status: &gtk::Label,
+    grip: &gtk::DrawingArea,
+    state: &Rc<RefCell<State>>,
+) {
+    let probe = gtk::DrawingArea::builder()
+        .content_height(0)
+        .hexpand(true)
+        .build();
+
+    let last = Rc::new(Cell::new(false));
+    let root_c = root.clone();
+    let status_c = status.clone();
+    let grip_c = grip.clone();
+    let state_c = state.clone();
+
+    probe.connect_resize(move |_, width, _| {
+        let compact = width > 0 && width < COMPACT_WIDTH;
+        if compact == last.get() {
+            return;
+        }
+        last.set(compact);
+        state_c.borrow_mut().compact = compact;
+        render(&root_c, &status_c, &grip_c, &state_c);
+    });
+
+    root.append(&probe);
 }
 
 /// Named colours the panel depends on.
@@ -132,7 +187,11 @@ fn debug_css_on_realize(root: &gtk::Box) {
                     c.green(),
                     c.blue(),
                     c.alpha(),
-                    if c.alpha() < 1.0 { "  <-- NOT OPAQUE" } else { "" }
+                    if c.alpha() < 1.0 {
+                        "  <-- NOT OPAQUE"
+                    } else {
+                        ""
+                    }
                 ),
                 None => eprintln!("gnomon: @{name} DID NOT RESOLVE (declaration dropped)"),
             }
@@ -157,37 +216,48 @@ fn apply(state: &Rc<RefCell<State>>, snapshot: UsageSnapshot) -> bool {
 }
 
 /// Rebuild the children of `root` from the stored state.
-fn render(root: &gtk::Box, status: &gtk::Label, state: &Rc<RefCell<State>>) {
+fn render(
+    root: &gtk::Box,
+    status: &gtk::Label,
+    grip: &gtk::DrawingArea,
+    state: &Rc<RefCell<State>>,
+) {
+    // The width probe is re-appended below; unparent everything first.
     while let Some(child) = root.first_child() {
         root.remove(&child);
     }
 
     let mut rows = Vec::new();
-    let windows = state.borrow().windows.clone();
-    let loaded = state.borrow().loaded;
+    let (windows, loaded, compact) = {
+        let s = state.borrow();
+        (s.windows.clone(), s.loaded, s.compact)
+    };
 
     if !loaded {
         let loading = gtk::Label::builder().label("Loading usage…").build();
         loading.add_css_class("dim-label");
         root.append(&loading);
     } else if windows.is_empty() {
-        let empty = gtk::Label::builder().label("No limit windows reported").build();
+        let empty = gtk::Label::builder()
+            .label("No limit windows reported")
+            .build();
         empty.add_css_class("dim-label");
         root.append(&empty);
     } else {
         for window in &windows {
-            let (widget, row) = build_row(window);
+            let (widget, row) = build_row(window, compact);
             root.append(&widget);
             rows.push(row);
         }
     }
 
     root.append(status);
+    root.append(grip);
     state.borrow_mut().rows = rows;
 }
 
 /// One limit window: label + percent, a bar, and a countdown.
-fn build_row(window: &LimitWindow) -> (gtk::Box, Row) {
+fn build_row(window: &LimitWindow, compact: bool) -> (gtk::Box, Row) {
     let container = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(4)
@@ -197,9 +267,16 @@ fn build_row(window: &LimitWindow) -> (gtk::Box, Row) {
         .orientation(gtk::Orientation::Horizontal)
         .build();
 
-    let name = gtk::Label::builder().label(window.label()).xalign(0.0).build();
+    let name = gtk::Label::builder()
+        .label(window.label())
+        .xalign(0.0)
+        .build();
     let percent = gtk::Label::builder()
-        .label(format!("{:.1}%", window.percent))
+        .label(if compact {
+            format!("{:.0}%", window.percent)
+        } else {
+            format!("{:.1}%", window.percent)
+        })
         .xalign(1.0)
         .hexpand(true)
         .build();
@@ -214,6 +291,7 @@ fn build_row(window: &LimitWindow) -> (gtk::Box, Row) {
     let countdown_label = gtk::Label::builder()
         .label(countdown(window.resets_at))
         .xalign(0.0)
+        .visible(!compact)
         .build();
     countdown_label.add_css_class("dim-label");
 

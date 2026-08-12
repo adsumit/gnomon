@@ -60,6 +60,17 @@ Two transports. ONE schema. Both transports MUST deserialize into the same types
 
 Render one bar per entry in `limits[]`. Never hardcode a bar count.
 
+## Window behaviour
+
+- The layer surface is anchored Top and Left only. Its margins are therefore an absolute
+  position from the monitor's top-left corner, not an inset from two edges.
+- Keyboard interactivity is NONE in all states. gnomon never takes focus.
+- The exclusive zone is always 0. gnomon never reserves space or shifts other windows.
+- Pinned means click-through and non-interactive: the surface carries an empty input
+  region, so every click reaches whatever is beneath it.
+- The pin toggle is delivered by SIGUSR1, because a click-through surface cannot be
+  clicked to un-pin itself.
+
 ## Security rules
 
 - No credential is ever logged, cached to disk, or written to a crash dump.

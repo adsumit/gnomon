@@ -25,6 +25,15 @@ window.gnomon-layer.background {
   padding: 16px;
 }
 
+/* Pinned means click-through and non-interactive, so the affordance goes too. */
+window.pinned #root {
+  border: none;
+}
+
+#grip {
+  opacity: 0.35;
+}
+
 progressbar trough,
 progressbar progress {
   min-height: 6px;
