@@ -36,6 +36,9 @@ Two transports. ONE schema. Both transports MUST deserialize into the same types
 - `kind`, `group`, and `severity` are `String`. They are never enums.
 - `percent` parses as `f64`.
 - Unknown `severity` values render with error styling, not warning styling.
+- When `limits[]` is absent, synthesized windows carry `severity: None` and the render
+  class is derived from percent: <75 normal, <90 warning, else error.
+- `WindowSource` records whether a window came from `limits[]` or the legacy fallback.
 - The API emits unreleased codenamed keys. They MUST be ignored silently and MUST NEVER
   cause a parse failure.
 - Fixture `live_oauth.json` has unreleased codename keys renamed; see

@@ -1,3 +1,10 @@
 //! gnomon-core — core logic for the gnomon usage meter.
 //!
-//! Stub crate; no functionality yet.
+//! Parses the Claude usage payload into normalized types. No network code here.
+
+pub mod model;
+pub mod parse;
+mod wire;
+
+pub use model::{LimitWindow, UsageSnapshot, WindowSource};
+pub use parse::parse_snapshot;
