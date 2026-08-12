@@ -24,6 +24,9 @@
         return;
       }
 
+      // Visible proof in the claude.ai tab console that the courier ran.
+      console.debug('gnomon: forwarded', data.raw.length, 'bytes');
+
       // A sleeping or reloaded service worker makes this reject. That is
       // normal; swallow it so claude.ai's console stays clean.
       chrome.runtime.sendMessage({ kind: 'usage', raw: data.raw }, () => {

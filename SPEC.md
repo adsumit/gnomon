@@ -26,8 +26,12 @@ Two transports. ONE schema. Both transports MUST deserialize into the same types
 - The extension calls `claude.ai/api/organizations/{orgId}/usage` from inside the page.
 - The extension delivers results over Chrome native messaging (stdio) to the
   `com.gnomon.bridge` host. It MUST NOT use HTTP to reach gnomon.
-- The host forwards the raw payload to a Unix domain socket at
+- The host forwards the payload to a Unix domain socket at
   `$XDG_RUNTIME_DIR/gnomon/bridge.sock`.
+- The payload is semantically preserved but NOT byte-preserved on the
+  extension-to-host hop. `sendNativeMessage` takes an object, so the extension parses the
+  response text and Chrome re-serializes it; whitespace and number formatting are
+  normalized by Chrome.
 - gnomon opens no listening network socket, on loopback or otherwise. There is no port,
   so the extension holds no gnomon secret and there is nothing to authenticate.
 - gnomon itself never reads a cookie.

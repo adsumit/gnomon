@@ -141,7 +141,7 @@
         /* ignore */
       }
     });
-    observer.observe({ entryTypes: ['resource'], buffered: true });
+    observer.observe({ type: 'resource', buffered: true });
   } catch (_) {
     /* ignore */
   }

@@ -3,7 +3,7 @@
   "name": "gnomon bridge",
   "version": "0.1.0",
   "description": "Forwards claude.ai usage readings to the gnomon meter over native messaging.",
-  "permissions": ["nativeMessaging"],
+  "permissions": ["nativeMessaging", "storage"],
   "background": {
     "service_worker": "background.js"
   },

@@ -1,8 +1,7 @@
 # gnomon Chrome extension
 
 Reads claude.ai usage from inside the page and forwards it to the gnomon native
-messaging host. Requires `nativeMessaging` and nothing else — no host
-permissions, no network access of its own.
+messaging host. Requires `nativeMessaging` and `storage`, nothing else.
 
 ## Install
 
@@ -26,22 +25,29 @@ permissions, no network access of its own.
    only reads the host manifest at worker startup.
 
 6. Verify: open a claude.ai tab, then click **service worker** on the extension
-   card and run in that console:
+   card and run `await gnomonStats()` in that console.
 
-       chrome.runtime.sendMessage({ kind: 'stats' }, console.log)
+## Reading the stats
 
-   A rising `ok` count means readings are reaching the host.
+`seen` counts usage messages received from the content script; `ok` and `fail`
+count native host outcomes; `lastOkAt` / `lastFailAt` are epoch milliseconds or
+null; `lastError` is the last failure message or null. Counters live in
+`chrome.storage.local`, so they survive the service worker being suspended.
+
+- `seen` at 0 — the content script never delivered. Check the claude.ai tab
+  console for `gnomon: forwarded N bytes`.
+- `seen` rising, `ok` flat — delivery works; the native host is the problem.
+  Read `lastError`.
+- `ok` rising — readings are reaching the host.
 
 ## The extension ID is not stable
 
-Chrome derives the ID from the unpacked directory's absolute path. Move or
-rename this directory, or load it from a different path, and the ID changes —
-the old host manifest then lists the wrong origin and Chrome refuses the
+Chrome derives the ID from this directory's absolute path. Move or rename it and
+the ID changes, the host manifest lists the wrong origin, and Chrome refuses the
 connection. Re-run step 4 with the new ID and reload.
 
 ## Fidelity note
 
-`sendNativeMessage` accepts an object, so `background.js` parses the raw text
-and Chrome re-serializes it. The host receives Chrome's encoding, not the
-server's original bytes. The document is semantically identical; the exact
-byte sequence is not preserved on this hop.
+`sendNativeMessage` accepts an object, so `background.js` parses the raw text and
+Chrome re-serializes it. The host receives Chrome's encoding: semantically
+identical, not byte-identical.
