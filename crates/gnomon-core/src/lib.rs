@@ -12,6 +12,10 @@ pub mod oauth;
 pub mod parse;
 mod wire;
 
+/// Re-exported so dependent crates can format timestamps without taking their
+/// own chrono dependency.
+pub use chrono;
+
 pub use error::SourceError;
 pub use model::{LimitWindow, UsageSnapshot, WindowSource};
 pub use parse::parse_snapshot;
