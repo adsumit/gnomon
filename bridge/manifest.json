@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "gnomon bridge",
+  "version": "0.1.0",
+  "description": "Forwards claude.ai usage readings to the gnomon meter over native messaging.",
+  "permissions": ["nativeMessaging"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://claude.ai/*"],
+      "js": ["page.js"],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://claude.ai/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
+    }
+  ]
+}

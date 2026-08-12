@@ -19,39 +19,95 @@ const ALLOWED_ORIGIN: &str = "chrome-extension://REPLACE_WITH_EXTENSION_ID/";
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    if args.iter().any(|a| a == "--print-manifest") {
-        return match print_manifest() {
+    match args.first().map(String::as_str) {
+        Some("--print-manifest") => match print_manifest() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("gnomon-bridge: {e}");
                 ExitCode::from(1)
             }
-        };
+        },
+        Some("--install-manifest") => match args.get(1) {
+            Some(id) => match install_manifest(id) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("gnomon-bridge: {e}");
+                    ExitCode::from(1)
+                }
+            },
+            None => {
+                eprintln!("gnomon-bridge: --install-manifest requires an extension ID");
+                ExitCode::from(1)
+            }
+        },
+        Some(unknown) => {
+            eprintln!("gnomon-bridge: unrecognised argument `{unknown}`");
+            ExitCode::from(1)
+        }
+        None => run(),
     }
-
-    if let Some(unknown) = args.first() {
-        eprintln!("gnomon-bridge: unrecognised argument `{unknown}`");
-        return ExitCode::from(1);
-    }
-
-    run()
 }
 
-/// Print the Chrome native messaging host manifest. Installs nothing.
-fn print_manifest() -> Result<(), String> {
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("cannot resolve current executable: {e}"))?;
+/// Build the host manifest for a given extension origin.
+fn manifest_json(origin: &str) -> Result<String, String> {
+    let exe =
+        std::env::current_exe().map_err(|e| format!("cannot resolve current executable: {e}"))?;
 
     let manifest = serde_json::json!({
         "name": HOST_NAME,
         "description": HOST_DESCRIPTION,
         "path": exe.to_string_lossy(),
         "type": "stdio",
-        "allowed_origins": [ALLOWED_ORIGIN],
+        "allowed_origins": [origin],
     });
 
-    let text = serde_json::to_string_pretty(&manifest)
-        .map_err(|e| format!("cannot serialize manifest: {e}"))?;
+    serde_json::to_string_pretty(&manifest).map_err(|e| format!("cannot serialize manifest: {e}"))
+}
+
+/// Print the Chrome native messaging host manifest. Installs nothing.
+fn print_manifest() -> Result<(), String> {
+    println!("{}", manifest_json(ALLOWED_ORIGIN)?);
+    Ok(())
+}
+
+/// A Chrome extension ID is exactly 32 characters drawn from `a`–`p`.
+fn validate_extension_id(id: &str) -> Result<(), String> {
+    let count = id.chars().count();
+    if count != 32 {
+        return Err(format!(
+            "extension ID must be exactly 32 characters, got {count}"
+        ));
+    }
+
+    if let Some(bad) = id.chars().find(|c| !matches!(c, 'a'..='p')) {
+        return Err(format!(
+            "extension ID must use only lowercase letters a-p, found `{bad}`"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Write the host manifest into Chrome's NativeMessagingHosts directory.
+fn install_manifest(extension_id: &str) -> Result<(), String> {
+    validate_extension_id(extension_id)?;
+
+    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+    let dir = std::path::Path::new(&home)
+        .join(".config")
+        .join("google-chrome")
+        .join("NativeMessagingHosts");
+
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("cannot create {}: {}", dir.display(), e))?;
+
+    let path = dir.join(format!("{HOST_NAME}.json"));
+    let text = manifest_json(&format!("chrome-extension://{extension_id}/"))?;
+
+    std::fs::write(&path, format!("{text}\n"))
+        .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
+
+    println!("wrote {}", path.display());
     println!("{text}");
     Ok(())
 }
@@ -156,4 +212,52 @@ fn read_frame(input: &mut impl Read) -> Result<Option<Vec<u8>>, String> {
         .map_err(|e| format!("truncated payload: {e}"))?;
 
     Ok(Some(payload))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_extension_id;
+
+    /// 32 characters, all within a-p.
+    const VALID: &str = "abcdefghijklmnopabcdefghijklmnop";
+
+    #[test]
+    fn accepts_a_valid_id() {
+        assert_eq!(VALID.len(), 32);
+        assert!(validate_extension_id(VALID).is_ok());
+    }
+
+    #[test]
+    fn rejects_empty() {
+        assert!(validate_extension_id("").is_err());
+    }
+
+    #[test]
+    fn rejects_thirty_one_characters() {
+        let short = &VALID[..31];
+        assert_eq!(short.len(), 31);
+        assert!(validate_extension_id(short).is_err());
+    }
+
+    #[test]
+    fn rejects_thirty_three_characters() {
+        let long = format!("{VALID}a");
+        assert_eq!(long.len(), 33);
+        assert!(validate_extension_id(&long).is_err());
+    }
+
+    #[test]
+    fn rejects_uppercase() {
+        let upper = VALID.to_uppercase();
+        assert_eq!(upper.len(), 32);
+        assert!(validate_extension_id(&upper).is_err());
+    }
+
+    #[test]
+    fn rejects_letter_outside_a_to_p() {
+        // Correct length, lowercase, but 'z' is out of range.
+        let with_z = format!("z{}", &VALID[1..]);
+        assert_eq!(with_z.len(), 32);
+        assert!(validate_extension_id(&with_z).is_err());
+    }
 }
