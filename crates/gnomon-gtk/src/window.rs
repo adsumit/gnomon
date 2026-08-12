@@ -13,8 +13,14 @@ use crate::feed::{self, Update};
 const SEVERITY_CLASSES: [&str; 3] = ["sev-normal", "sev-warning", "sev-error"];
 /// Below this width the panel drops the countdowns and the decimal place.
 const COMPACT_WIDTH: i32 = 240;
+/// Below either of these the panel also tightens its padding and spacing.
+const TIGHT_WIDTH: i32 = 200;
+const TIGHT_HEIGHT: i32 = 150;
+/// Root box spacing, normal and tightened.
+const SPACING: i32 = 14;
+const SPACING_TIGHT: i32 = 6;
 /// Edge length of the resize grip.
-const GRIP_SIZE: i32 = 20;
+const GRIP_SIZE: i32 = 14;
 
 /// One rendered limit window, kept so the countdown can tick without a rebuild.
 struct Row {
@@ -40,13 +46,12 @@ pub struct Content {
 
 /// Build the content tree, start the feed, and wire up updates.
 pub fn build() -> Content {
+    // No widget margins: #root's 16px CSS padding provides the inset *inside*
+    // the painted background. Margins would push the background away from the
+    // surface edge and strand the overlay-aligned grip outside it.
     let root = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(14)
-        .margin_top(16)
-        .margin_bottom(16)
-        .margin_start(16)
-        .margin_end(16)
+        .spacing(SPACING)
         .build();
     root.set_widget_name("root");
     // Natural content width must not be a floor, or the resize grip cannot
@@ -70,8 +75,10 @@ pub fn build() -> Content {
         .height_request(GRIP_SIZE)
         .halign(gtk::Align::End)
         .valign(gtk::Align::End)
-        .margin_end(6)
-        .margin_bottom(6)
+        .margin_end(8)
+        .margin_bottom(8)
+        // Revealed on hover, and only when the panel is interactive.
+        .visible(false)
         .build();
     grip.set_widget_name("grip");
     draw_grip(&grip);
@@ -83,8 +90,19 @@ pub fn build() -> Content {
         compact: false,
     }));
 
+    // The ScrolledWindow is what decouples the surface size from the content's
+    // natural size: without it the surface refused to shrink below 300x176.
+    // External policy means the scrollbars exist but are never drawn.
+    let scrolled = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::External)
+        .vscrollbar_policy(gtk::PolicyType::External)
+        .propagate_natural_width(false)
+        .propagate_natural_height(false)
+        .child(&root)
+        .build();
+
     let overlay = gtk::Overlay::new();
-    overlay.set_child(Some(&root));
+    overlay.set_child(Some(&scrolled));
 
     render(&root, &status, &state);
     debug_css_on_realize(&root);
@@ -151,26 +169,44 @@ fn watch_width(
     status: &gtk::Label,
     state: &Rc<RefCell<State>>,
 ) {
+    // Fills the overlay so its `resize` signal reports both dimensions.
     let probe = gtk::DrawingArea::builder()
+        .content_width(0)
         .content_height(0)
         .hexpand(true)
-        .valign(gtk::Align::Start)
+        .vexpand(true)
         .can_target(false)
         .build();
 
-    let last = Rc::new(Cell::new(false));
+    let last_compact = Rc::new(Cell::new(false));
+    let last_tight = Rc::new(Cell::new(false));
     let root_c = root.clone();
     let status_c = status.clone();
     let state_c = state.clone();
 
-    probe.connect_resize(move |_, width, _| {
+    probe.connect_resize(move |_, width, height| {
         let compact = width > 0 && width < COMPACT_WIDTH;
-        if compact == last.get() {
-            return;
+        let tight =
+            (width > 0 && width < TIGHT_WIDTH) || (height > 0 && height < TIGHT_HEIGHT);
+
+        // Padding and spacing: no rebuild needed, just restyle.
+        if tight != last_tight.get() {
+            last_tight.set(tight);
+            if tight {
+                root_c.add_css_class("compact");
+                root_c.set_spacing(SPACING_TIGHT);
+            } else {
+                root_c.remove_css_class("compact");
+                root_c.set_spacing(SPACING);
+            }
         }
-        last.set(compact);
-        state_c.borrow_mut().compact = compact;
-        render(&root_c, &status_c, &state_c);
+
+        // Label content: this one does need a rebuild.
+        if compact != last_compact.get() {
+            last_compact.set(compact);
+            state_c.borrow_mut().compact = compact;
+            render(&root_c, &status_c, &state_c);
+        }
     });
 
     // An overlay child, not a box child: render() clears the box, which
@@ -194,11 +230,11 @@ fn draw_grip(grip: &gtk::DrawingArea) {
         );
 
         for i in 0..3 {
-            let offset = 4.0 + (i as f64) * 5.5;
+            let offset = 3.5 + (i as f64) * 4.0;
             cr.arc(
                 width as f64 - offset,
                 height as f64 - offset,
-                1.6,
+                1.2,
                 0.0,
                 std::f64::consts::TAU,
             );

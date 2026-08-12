@@ -29,6 +29,8 @@ struct Panel {
     /// Set when a left-drag began inside the grip, so the move gesture stands
     /// down for the whole sequence rather than only at drag-begin.
     drag_ignored: Cell<bool>,
+    /// Pointer is somewhere over the panel.
+    hovered: Cell<bool>,
     monitor: Cell<(i32, i32)>,
     /// The size the window was configured with, valid before allocation.
     default_size: (i32, i32),
@@ -191,20 +193,23 @@ fn build_window(app: &adw::Application, toplevel: bool) {
         }),
         resize_origin: Cell::new(DEFAULT_SIZE),
         drag_ignored: Cell::new(false),
+        hovered: Cell::new(false),
         monitor: Cell::new((0, 0)),
         default_size: DEFAULT_SIZE,
         layered: !toplevel,
     });
 
     wire_drag(&panel, &content.root);
-    if toplevel {
-        // The compositor already provides resize handles; ours would only
-        // fight it by pinning a minimum size.
-        content.grip.set_visible(false);
-    } else {
+    if !toplevel {
+        // In toplevel mode the compositor provides resize handles; ours would
+        // only fight it by pinning a minimum size.
         wire_grip(&panel);
+        // Independent of the grip: right-drag resizes whether or not the grip
+        // is currently revealed.
         wire_right_button_resize(&panel, &content.root);
     }
+    wire_hover(&panel, &content.overlay);
+    update_grip_visibility(&panel);
     wire_signal(&panel, sig_rx);
 
     {
@@ -352,6 +357,41 @@ fn wire_drag(panel: &Rc<Panel>, root: &gtk::Box) {
     root.add_controller(drag);
 }
 
+/// Reveal the grip on hover, hide it on leave.
+fn wire_hover(panel: &Rc<Panel>, overlay: &gtk::Overlay) {
+    let motion = gtk::EventControllerMotion::new();
+
+    {
+        let panel = panel.clone();
+        motion.connect_enter(move |_, _, _| {
+            panel.hovered.set(true);
+            update_grip_visibility(&panel);
+        });
+    }
+
+    {
+        let panel = panel.clone();
+        motion.connect_leave(move |_| {
+            panel.hovered.set(false);
+            update_grip_visibility(&panel);
+        });
+    }
+
+    overlay.add_controller(motion);
+}
+
+/// The single place that decides whether the grip is on screen.
+///
+/// The two hard conditions are evaluated FIRST and combined into `interactive`;
+/// hover is only ANDed on afterwards. Hover can therefore never resurrect the
+/// grip while pinned or in toplevel mode — it can only reveal a grip that is
+/// already permitted. Every path that changes any of the three inputs calls
+/// this, so there is no second place for the rule to drift.
+fn update_grip_visibility(panel: &Rc<Panel>) {
+    let interactive = panel.layered && !panel.pinned.get();
+    panel.grip.set_visible(interactive && panel.hovered.get());
+}
+
 /// Is this point, in `origin`'s coordinate space, inside the grip?
 ///
 /// `compute_bounds` translates between the two widgets explicitly, so this does
@@ -456,7 +496,7 @@ fn set_pinned(panel: &Rc<Panel>, pinned: bool) {
         panel.win.remove_css_class("pinned");
     }
 
-    panel.grip.set_visible(!pinned);
+    update_grip_visibility(panel);
     pin::apply_input_region(&panel.win, pinned);
 
     eprintln!(

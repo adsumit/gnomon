@@ -26,6 +26,19 @@ window.gnomon-layer.background {
   padding: 16px;
 }
 
+/* Tightened when the panel is small, so shrinking reflows rather than clips. */
+#root.compact {
+  padding: 8px;
+}
+
+/* The ScrolledWindow sits between the overlay and #root purely to decouple the
+   surface size from natural content size. It must not paint over #root. */
+scrolledwindow,
+scrolledwindow > viewport {
+  background: none;
+  background-color: transparent;
+}
+
 /* Pinned means click-through and non-interactive, so the affordance goes too. */
 window.pinned #root {
   border: none;
