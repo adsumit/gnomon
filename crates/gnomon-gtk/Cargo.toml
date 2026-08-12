@@ -8,3 +8,5 @@ name = "gnomon"
 path = "src/main.rs"
 
 [dependencies]
+gnomon-core = { version = "0.1.0", path = "../gnomon-core" }
+serde_json = "1.0.151"

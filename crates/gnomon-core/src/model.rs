@@ -4,9 +4,11 @@
 //! attributes — see [`crate::wire`] for the deserialize-only mirrors of the API.
 
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 
 /// Where a [`LimitWindow`] came from.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WindowSource {
     /// Mapped from an entry in the `limits[]` array.
     Api,
@@ -15,7 +17,7 @@ pub enum WindowSource {
 }
 
 /// A single usage window.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct LimitWindow {
     pub kind: String,
     pub group: String,
@@ -29,7 +31,7 @@ pub struct LimitWindow {
 }
 
 /// A point-in-time view of every usage window.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct UsageSnapshot {
     pub windows: Vec<LimitWindow>,
     pub captured_at: DateTime<Utc>,
