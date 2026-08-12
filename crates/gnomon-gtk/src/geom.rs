@@ -22,11 +22,17 @@ pub struct Margins {
 }
 
 /// Where the panel should sit initially: top-right, with a 12px gap.
+///
+/// The result is clamped. A caller that passes a not-yet-allocated panel size
+/// would otherwise compute a position almost entirely off the right edge, which
+/// is precisely how the panel went missing after M4.
 pub fn initial_margins(panel: (i32, i32), monitor: (i32, i32)) -> Margins {
-    Margins {
+    let raw = Margins {
         left: monitor.0 - panel.0 - EDGE_GAP,
         top: EDGE_GAP,
-    }
+    };
+
+    clamp_margins(raw.left, raw.top, panel, monitor)
 }
 
 /// Keep at least [`MIN_VISIBLE`] pixels of the panel on screen on every side.
@@ -107,6 +113,26 @@ mod tests {
                 left: 1920 - 300 - 12,
                 top: 12
             }
+        );
+    }
+
+    #[test]
+    fn initial_margins_survive_a_zero_width_panel() {
+        // The M4 regression: reading the panel size before allocation yields 0,
+        // which naively places the panel off the right edge of the monitor.
+        let m = initial_margins((0, 150), MONITOR);
+
+        // Whatever it returns must already satisfy the clamp — that is, feeding
+        // it back through must change nothing.
+        assert_eq!(
+            clamp_margins(m.left, m.top, (0, 150), MONITOR),
+            m,
+            "initial_margins must return an already-clamped position"
+        );
+        assert!(
+            m.left <= MONITOR.0 - MIN_VISIBLE,
+            "left {} would put the panel off the right edge",
+            m.left
         );
     }
 

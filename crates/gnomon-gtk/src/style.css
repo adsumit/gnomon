@@ -6,18 +6,19 @@ window.gnomon-layer.background {
   background-color: transparent;
 }
 
+/* The runtime probe confirmed every @-name below resolves, so the var(--...)
+   tier is gone. The literal before each @-name stays as a last resort: a
+   see-through panel is worse than one that ignores the theme.
+
+   @borders is intentionally translucent — rgba(1, 1, 1, 0.15) — so the earlier
+   NOT OPAQUE warning about it was a false alarm. Only the panel background has
+   to be fully opaque. */
 #root {
-  /* Declared three times on purpose, weakest first. A declaration whose value
-     fails to parse or resolve is dropped individually, so whichever of these
-     survives wins. The literal is an opaque last resort: a see-through panel is
-     worse than one that ignores the theme. */
   background-color: #242424;
   background-color: @window_bg_color;
-  background-color: var(--window-bg-color);
 
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-color: @borders;
-  border-color: var(--borders);
 
   border-radius: 16px;
 
@@ -42,15 +43,12 @@ progressbar progress {
 
 progressbar.sev-normal progress {
   background-color: @accent_bg_color;
-  background-color: var(--accent-bg-color);
 }
 
 progressbar.sev-warning progress {
   background-color: @warning_bg_color;
-  background-color: var(--warning-bg-color);
 }
 
 progressbar.sev-error progress {
   background-color: @error_bg_color;
-  background-color: var(--error-bg-color);
 }

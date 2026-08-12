@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use chrono::{DateTime, Utc};
 use gnomon_core::{LimitWindow, UsageSnapshot};
-use gtk::glib;
+use gtk::{glib, pango};
 use gtk::prelude::*;
 
 use crate::feed::{self, Update};
@@ -47,11 +47,15 @@ pub fn build() -> Content {
         .margin_end(16)
         .build();
     root.set_widget_name("root");
+    // Natural content width must not be a floor, or the resize grip cannot
+    // shrink the panel below whatever the labels happen to need.
+    root.set_size_request(0, -1);
 
     let status = gtk::Label::builder()
         .wrap(true)
         .xalign(0.0)
         .visible(false)
+        .ellipsize(pango::EllipsizeMode::End)
         .build();
     status.add_css_class("dim-label");
 
@@ -187,7 +191,9 @@ fn debug_css_on_realize(root: &gtk::Box) {
                     c.green(),
                     c.blue(),
                     c.alpha(),
-                    if c.alpha() < 1.0 {
+                    // @borders is intentionally translucent; only the panel
+                    // background must be fully opaque.
+                    if name == "window_bg_color" && c.alpha() < 1.0 {
                         "  <-- NOT OPAQUE"
                     } else {
                         ""
@@ -234,12 +240,16 @@ fn render(
     };
 
     if !loaded {
-        let loading = gtk::Label::builder().label("Loading usage…").build();
+        let loading = gtk::Label::builder()
+            .label("Loading usage…")
+            .ellipsize(pango::EllipsizeMode::End)
+            .build();
         loading.add_css_class("dim-label");
         root.append(&loading);
     } else if windows.is_empty() {
         let empty = gtk::Label::builder()
             .label("No limit windows reported")
+            .ellipsize(pango::EllipsizeMode::End)
             .build();
         empty.add_css_class("dim-label");
         root.append(&empty);
@@ -270,6 +280,7 @@ fn build_row(window: &LimitWindow, compact: bool) -> (gtk::Box, Row) {
     let name = gtk::Label::builder()
         .label(window.label())
         .xalign(0.0)
+        .ellipsize(pango::EllipsizeMode::End)
         .build();
     let percent = gtk::Label::builder()
         .label(if compact {
@@ -279,6 +290,7 @@ fn build_row(window: &LimitWindow, compact: bool) -> (gtk::Box, Row) {
         })
         .xalign(1.0)
         .hexpand(true)
+        .ellipsize(pango::EllipsizeMode::End)
         .build();
 
     header.append(&name);
@@ -292,6 +304,7 @@ fn build_row(window: &LimitWindow, compact: bool) -> (gtk::Box, Row) {
         .label(countdown(window.resets_at))
         .xalign(0.0)
         .visible(!compact)
+        .ellipsize(pango::EllipsizeMode::End)
         .build();
     countdown_label.add_css_class("dim-label");
 

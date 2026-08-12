@@ -11,6 +11,9 @@ use crate::geom::{self, Margins};
 use crate::{pin, window};
 
 const APP_ID: &str = "com.gnomon.Gnomon";
+/// Initial window size, and the size used to place the panel before the first
+/// allocation makes a real measurement available.
+const DEFAULT_SIZE: (i32, i32) = (300, 150);
 const STYLE: &str = include_str!("style.css");
 
 /// Everything the gestures and the signal handler need to share.
@@ -24,6 +27,8 @@ struct Panel {
     /// Window size at the moment a grip drag began.
     resize_origin: Cell<(i32, i32)>,
     monitor: Cell<(i32, i32)>,
+    /// The size the window was configured with, valid before allocation.
+    default_size: (i32, i32),
     layered: bool,
 }
 
@@ -33,13 +38,38 @@ impl Panel {
     }
 
     /// Push the stored margins onto the layer surface.
-    fn apply_margins(&self) {
-        if !self.layered {
+    ///
+    /// `size` and `size_source` exist for the diagnostics: knowing *which*
+    /// number fed the calculation is the whole point of the probe.
+    fn apply_margins(&self, phase: &str, size: (i32, i32), size_source: &str) {
+        if self.layered {
+            let m = self.margins.get();
+            self.win.set_margin(Edge::Left, m.left);
+            self.win.set_margin(Edge::Top, m.top);
+        }
+        self.debug_geom(phase, size, size_source);
+    }
+
+    /// Unconditional geometry trace, behind `GNOMON_DEBUG_GEOM`.
+    fn debug_geom(&self, phase: &str, size: (i32, i32), size_source: &str) {
+        if std::env::var_os("GNOMON_DEBUG_GEOM").is_none() {
             return;
         }
         let m = self.margins.get();
-        self.win.set_margin(Edge::Left, m.left);
-        self.win.set_margin(Edge::Top, m.top);
+        let mon = self.monitor.get();
+        eprintln!(
+            "gnomon geom[{phase}]: monitor={}x{} panel={}x{} (source: {}) \
+margin_left={} margin_top={} anchors={} pinned={}",
+            mon.0,
+            mon.1,
+            size.0,
+            size.1,
+            size_source,
+            m.left,
+            m.top,
+            if self.layered { "Top+Left" } else { "n/a (toplevel)" },
+            self.pinned.get(),
+        );
     }
 }
 
@@ -83,8 +113,8 @@ fn build_window(app: &adw::Application, toplevel: bool) {
 
     let win = adw::ApplicationWindow::builder()
         .application(app)
-        .default_width(300)
-        .default_height(150)
+        .default_width(DEFAULT_SIZE.0)
+        .default_height(DEFAULT_SIZE.1)
         .resizable(true)
         .title("gnomon")
         .build();
@@ -123,13 +153,20 @@ fn build_window(app: &adw::Application, toplevel: bool) {
             left: geom::EDGE_GAP,
             top: geom::EDGE_GAP,
         }),
-        resize_origin: Cell::new((300, 150)),
+        resize_origin: Cell::new(DEFAULT_SIZE),
         monitor: Cell::new((0, 0)),
+        default_size: DEFAULT_SIZE,
         layered: !toplevel,
     });
 
     wire_drag(&panel, &content.root);
-    wire_grip(&panel);
+    if toplevel {
+        // The compositor already provides resize handles; ours would only
+        // fight it by pinning a minimum size.
+        content.grip.set_visible(false);
+    } else {
+        wire_grip(&panel);
+    }
     wire_signal(&panel, sig_rx);
 
     {
@@ -156,18 +193,28 @@ fn place_initially(panel: &Rc<Panel>) {
         return;
     }
 
-    let margins = if monitor.0 > 0 {
-        geom::initial_margins(panel.panel_size(), monitor)
+    // Deliberately NOT panel_size(): at realize the window has not been
+    // allocated, so its width reads 0 and the panel lands off-screen right.
+    let size = panel.default_size;
+
+    let (margins, source) = if monitor.0 > 0 && monitor.1 > 0 {
+        (
+            geom::initial_margins(size, monitor),
+            "configured default size",
+        )
     } else {
-        // Monitor unknown: sit at the left gap rather than guess.
-        Margins {
-            left: geom::EDGE_GAP,
-            top: geom::EDGE_GAP,
-        }
+        // Monitor unknown: do not compute an offset at all.
+        (
+            Margins {
+                left: geom::EDGE_GAP,
+                top: geom::EDGE_GAP,
+            },
+            "monitor unknown, no offset computed",
+        )
     };
 
     panel.margins.set(margins);
-    panel.apply_margins();
+    panel.apply_margins("realize", size, source);
 }
 
 /// Ask the display which monitor holds our surface, then read its geometry.
@@ -238,7 +285,7 @@ fn wire_drag(panel: &Rc<Panel>, root: &gtk::Box) {
                 panel.monitor.get(),
             );
             panel.margins.set(clamped);
-            panel.apply_margins();
+            panel.apply_margins("drag", panel.panel_size(), "allocated");
         });
     }
 
@@ -251,7 +298,7 @@ fn wire_drag(panel: &Rc<Panel>, root: &gtk::Box) {
             let m = panel.margins.get();
             let snapped = geom::snap_margins(m.left, m.top, panel.panel_size(), panel.monitor.get());
             panel.margins.set(snapped);
-            panel.apply_margins();
+            panel.apply_margins("snap", panel.panel_size(), "allocated");
         });
     }
 
@@ -272,7 +319,10 @@ fn wire_grip(panel: &Rc<Panel>) {
     {
         let panel = panel.clone();
         drag.connect_drag_update(move |_, dx, dy| {
-            if panel.pinned.get() {
+            // set_size_request sets a MINIMUM, which would stop the compositor
+            // shrinking a toplevel window. Layer surfaces size themselves, so
+            // it is only correct there.
+            if panel.pinned.get() || !panel.layered {
                 return;
             }
             let (w0, h0) = panel.resize_origin.get();
