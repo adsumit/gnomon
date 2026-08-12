@@ -1,9 +1,13 @@
-//! gnomon CLI. No GTK yet — `--once` performs a single fetch and prints.
+//! gnomon CLI and GUI entry point.
 
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use gnomon_core::{oauth, LimitWindow, SourceError, UsageSnapshot};
+use gnomon_core::{oauth, SourceError, UsageSnapshot};
+use gtk::glib;
+
+mod app;
+mod feed;
+mod window;
 
 /// Width the kind label is padded to in human-readable output.
 const LABEL_WIDTH: usize = 10;
@@ -12,7 +16,8 @@ const USAGE: &str = "\
 gnomon — a Wayland-native usage meter for Claude subscription limits.
 
 USAGE:
-    gnomon                 no UI yet
+    gnomon                 launch the meter as a layer surface
+    gnomon --toplevel      launch as an ordinary window instead
     gnomon --once          fetch once and print each limit window
     gnomon --once --json   fetch once and print the snapshot as JSON
     gnomon --help          show this message
@@ -31,23 +36,28 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    if flags.is_empty() {
-        println!("gnomon: no UI yet, try --once");
-        return ExitCode::SUCCESS;
-    }
-
     let once = flags.contains(&"--once");
     let json = flags.contains(&"--json");
+    let toplevel = flags.contains(&"--toplevel");
 
-    if let Some(unknown) = flags.iter().find(|f| !matches!(**f, "--once" | "--json")) {
+    if let Some(unknown) = flags
+        .iter()
+        .find(|f| !matches!(**f, "--once" | "--json" | "--toplevel"))
+    {
         eprintln!("gnomon: unrecognised argument `{unknown}`");
         eprintln!("{USAGE}");
         return ExitCode::from(1);
     }
 
     if !once {
-        eprintln!("gnomon: --json requires --once");
-        return ExitCode::from(1);
+        if json {
+            eprintln!("gnomon: --json requires --once");
+            return ExitCode::from(1);
+        }
+        return match app::run(toplevel) {
+            code if code == glib::ExitCode::SUCCESS => ExitCode::SUCCESS,
+            _ => ExitCode::from(1),
+        };
     }
 
     match oauth::fetch_snapshot() {
@@ -89,46 +99,14 @@ fn print_human(snapshot: &UsageSnapshot) {
         return;
     }
 
-    for window in &snapshot.windows {
+    for w in &snapshot.windows {
         println!(
             "{:<width$} {:>5.1}%  {:<8} {}",
-            window.label(),
-            window.percent,
-            window.severity_class(),
-            countdown(window),
+            w.label(),
+            w.percent,
+            w.severity_class(),
+            window::countdown(w.resets_at),
             width = LABEL_WIDTH,
         );
-    }
-}
-
-/// "resets in 3h 32m", or "—" when the window carries no reset time.
-///
-/// Uses `timestamp()` and `SystemTime` rather than `chrono::Utc::now()` so this
-/// crate needs no direct chrono dependency.
-fn countdown(window: &LimitWindow) -> String {
-    let Some(resets_at) = window.resets_at else {
-        return "—".to_string();
-    };
-
-    let now_secs = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(d) => d.as_secs() as i64,
-        Err(_) => return "—".to_string(),
-    };
-
-    let minutes = (resets_at.timestamp() - now_secs) / 60;
-    if minutes <= 0 {
-        return "resets now".to_string();
-    }
-
-    let days = minutes / 1440;
-    let hours = (minutes % 1440) / 60;
-    let mins = minutes % 60;
-
-    if days > 0 {
-        format!("resets in {days}d {hours}h")
-    } else if hours > 0 {
-        format!("resets in {hours}h {mins}m")
-    } else {
-        format!("resets in {mins}m")
     }
 }

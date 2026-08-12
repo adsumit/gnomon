@@ -1,0 +1,27 @@
+window {
+  background: transparent;
+}
+
+#root {
+  background: @window_bg_color;
+  border: 1px solid @borders;
+  border-radius: 16px;
+}
+
+progressbar trough,
+progressbar progress {
+  min-height: 6px;
+  border-radius: 999px;
+}
+
+progressbar.sev-normal progress {
+  background: @accent_bg_color;
+}
+
+progressbar.sev-warning progress {
+  background: @warning_bg_color;
+}
+
+progressbar.sev-error progress {
+  background: @error_bg_color;
+}

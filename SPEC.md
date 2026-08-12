@@ -71,6 +71,9 @@ Render one bar per entry in `limits[]`. Never hardcode a bar count.
 ## Unverified, do not build on
 
 - The meaning of `is_active`.
-- The server-side recompute granularity of `percent`.
+- ~~The server-side recompute granularity of `percent`.~~ FINDING: three consecutive
+  readings seconds apart returned identical values with no usage in between, so `percent`
+  changes only when usage is consumed. The GUI therefore skips redraws on unchanged
+  payloads.
 - Whether Chrome's Local Network Access prompt affects extension service workers. Native
   messaging was chosen over loopback so the answer does not matter.

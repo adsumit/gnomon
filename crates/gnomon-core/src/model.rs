@@ -17,7 +17,10 @@ pub enum WindowSource {
 }
 
 /// A single usage window.
-#[derive(Debug, Clone, Serialize)]
+///
+/// `PartialEq` lets the GUI skip a redraw when a fresh payload carries the same
+/// values as the one on screen.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LimitWindow {
     pub kind: String,
     pub group: String,
