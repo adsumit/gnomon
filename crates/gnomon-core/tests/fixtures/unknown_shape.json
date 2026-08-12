@@ -1,0 +1,29 @@
+{
+  "limits": [
+    {
+      "kind": "quarterly_thing",
+      "group": "quarterly",
+      "percent": 96.5,
+      "severity": "critical",
+      "resets_at": null,
+      "scope": null,
+      "is_active": true
+    }
+  ],
+  "five_hour": null,
+  "seven_day": null,
+  "spend": null,
+  "velvet_antler": {
+    "utilization": 3.0,
+    "resets_at": null
+  },
+  "brass_lantern": {
+    "is_enabled": true,
+    "tier": "preview"
+  },
+  "hollow_reed": {
+    "nested": {
+      "count": 2
+    }
+  }
+}
