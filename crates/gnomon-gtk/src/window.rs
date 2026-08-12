@@ -14,7 +14,7 @@ const SEVERITY_CLASSES: [&str; 3] = ["sev-normal", "sev-warning", "sev-error"];
 /// Below this width the panel drops the countdowns and the decimal place.
 const COMPACT_WIDTH: i32 = 240;
 /// Edge length of the resize grip.
-const GRIP_SIZE: i32 = 16;
+const GRIP_SIZE: i32 = 20;
 
 /// One rendered limit window, kept so the countdown can tick without a rebuild.
 struct Row {
@@ -32,6 +32,8 @@ struct State {
 
 /// The pieces app.rs needs to wire up interaction.
 pub struct Content {
+    /// What the window's content is set to.
+    pub overlay: gtk::Overlay,
     pub root: gtk::Box,
     pub grip: gtk::DrawingArea,
 }
@@ -59,12 +61,20 @@ pub fn build() -> Content {
         .build();
     status.add_css_class("dim-label");
 
+    // Pinned to the panel's bottom-right corner by the overlay, so no box
+    // layout decision can move it.
     let grip = gtk::DrawingArea::builder()
         .content_width(GRIP_SIZE)
         .content_height(GRIP_SIZE)
+        .width_request(GRIP_SIZE)
+        .height_request(GRIP_SIZE)
         .halign(gtk::Align::End)
+        .valign(gtk::Align::End)
+        .margin_end(6)
+        .margin_bottom(6)
         .build();
     grip.set_widget_name("grip");
+    draw_grip(&grip);
 
     let state = Rc::new(RefCell::new(State {
         windows: Vec::new(),
@@ -73,9 +83,15 @@ pub fn build() -> Content {
         compact: false,
     }));
 
-    render(&root, &status, &grip, &state);
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&root));
+
+    render(&root, &status, &state);
     debug_css_on_realize(&root);
-    watch_width(&root, &status, &grip, &state);
+    watch_width(&overlay, &root, &status, &state);
+
+    // Added last so the grip sits above the probe.
+    overlay.add_overlay(&grip);
 
     let (tx, rx) = async_channel::unbounded::<Update>();
     feed::spawn(tx);
@@ -83,14 +99,13 @@ pub fn build() -> Content {
     {
         let root = root.clone();
         let status = status.clone();
-        let grip = grip.clone();
         let state = state.clone();
         glib::spawn_future_local(async move {
             while let Ok(update) = rx.recv().await {
                 match update {
                     Update::Snapshot(snapshot, _origin) => {
                         if apply(&state, snapshot) {
-                            render(&root, &status, &grip, &state);
+                            render(&root, &status, &state);
                         } else {
                             // Payload unchanged: clear any stale error without
                             // rebuilding the bars.
@@ -117,7 +132,11 @@ pub fn build() -> Content {
         });
     }
 
-    Content { root, grip }
+    Content {
+        overlay,
+        root,
+        grip,
+    }
 }
 
 /// Track the panel's width from its allocation, not from a timer.
@@ -127,20 +146,21 @@ pub fn build() -> Content {
 /// spans the row does have a `resize` signal, and it fires on allocation — so
 /// it serves as an allocation probe without drawing anything.
 fn watch_width(
+    overlay: &gtk::Overlay,
     root: &gtk::Box,
     status: &gtk::Label,
-    grip: &gtk::DrawingArea,
     state: &Rc<RefCell<State>>,
 ) {
     let probe = gtk::DrawingArea::builder()
         .content_height(0)
         .hexpand(true)
+        .valign(gtk::Align::Start)
+        .can_target(false)
         .build();
 
     let last = Rc::new(Cell::new(false));
     let root_c = root.clone();
     let status_c = status.clone();
-    let grip_c = grip.clone();
     let state_c = state.clone();
 
     probe.connect_resize(move |_, width, _| {
@@ -150,10 +170,41 @@ fn watch_width(
         }
         last.set(compact);
         state_c.borrow_mut().compact = compact;
-        render(&root_c, &status_c, &grip_c, &state_c);
+        render(&root_c, &status_c, &state_c);
     });
 
-    root.append(&probe);
+    // An overlay child, not a box child: render() clears the box, which
+    // previously orphaned the probe on the first snapshot and silently killed
+    // the responsive mode.
+    overlay.add_overlay(&probe);
+}
+
+/// Three dots stepping up the diagonal, in the theme's foreground colour.
+///
+/// The 0.35 opacity comes from `#grip` in the stylesheet, so this just uses the
+/// resolved foreground directly.
+fn draw_grip(grip: &gtk::DrawingArea) {
+    grip.set_draw_func(|area, cr, width, height| {
+        let c = area.color();
+        cr.set_source_rgba(
+            c.red() as f64,
+            c.green() as f64,
+            c.blue() as f64,
+            c.alpha() as f64,
+        );
+
+        for i in 0..3 {
+            let offset = 4.0 + (i as f64) * 5.5;
+            cr.arc(
+                width as f64 - offset,
+                height as f64 - offset,
+                1.6,
+                0.0,
+                std::f64::consts::TAU,
+            );
+            let _ = cr.fill();
+        }
+    });
 }
 
 /// Named colours the panel depends on.
@@ -222,13 +273,9 @@ fn apply(state: &Rc<RefCell<State>>, snapshot: UsageSnapshot) -> bool {
 }
 
 /// Rebuild the children of `root` from the stored state.
-fn render(
-    root: &gtk::Box,
-    status: &gtk::Label,
-    grip: &gtk::DrawingArea,
-    state: &Rc<RefCell<State>>,
-) {
-    // The width probe is re-appended below; unparent everything first.
+fn render(root: &gtk::Box, status: &gtk::Label, state: &Rc<RefCell<State>>) {
+    // The probe and the grip live in the overlay, so rebuilding the box's
+    // children cannot destroy them.
     while let Some(child) = root.first_child() {
         root.remove(&child);
     }
@@ -262,7 +309,6 @@ fn render(
     }
 
     root.append(status);
-    root.append(grip);
     state.borrow_mut().rows = rows;
 }
 

@@ -24,8 +24,11 @@ struct Panel {
     margins: Cell<Margins>,
     /// Margins at the moment a drag began.
     drag_origin: Cell<Margins>,
-    /// Window size at the moment a grip drag began.
+    /// Window size at the moment a resize drag began.
     resize_origin: Cell<(i32, i32)>,
+    /// Set when a left-drag began inside the grip, so the move gesture stands
+    /// down for the whole sequence rather than only at drag-begin.
+    drag_ignored: Cell<bool>,
     monitor: Cell<(i32, i32)>,
     /// The size the window was configured with, valid before allocation.
     default_size: (i32, i32),
@@ -48,6 +51,39 @@ impl Panel {
             self.win.set_margin(Edge::Top, m.top);
         }
         self.debug_geom(phase, size, size_source);
+    }
+
+    /// Trace a resize request and, once layout has run, what it actually got.
+    ///
+    /// Reading the allocation immediately would only report the pre-resize
+    /// size, so the follow-up runs on the next idle. The pair distinguishes
+    /// "the gesture never fired" from "it fired and the surface refused".
+    fn debug_resize(self: &Rc<Self>, phase: &'static str, requested: (i32, i32)) {
+        if std::env::var_os("GNOMON_DEBUG_GEOM").is_none() {
+            return;
+        }
+        let before = self.panel_size();
+        eprintln!(
+            "gnomon geom[{phase}]: requested={}x{} allocated_before={}x{}",
+            requested.0, requested.1, before.0, before.1,
+        );
+
+        let panel = self.clone();
+        glib::idle_add_local_once(move || {
+            let after = panel.panel_size();
+            eprintln!(
+                "gnomon geom[{phase}-settled]: requested={}x{} allocated_after={}x{}{}",
+                requested.0,
+                requested.1,
+                after.0,
+                after.1,
+                if after == requested {
+                    ""
+                } else {
+                    "  <-- SURFACE DID NOT TAKE THE REQUESTED SIZE"
+                },
+            );
+        });
     }
 
     /// Unconditional geometry trace, behind `GNOMON_DEBUG_GEOM`.
@@ -139,7 +175,7 @@ fn build_window(app: &adw::Application, toplevel: bool) {
     }
 
     let content = window::build();
-    win.set_content(Some(&content.root));
+    win.set_content(Some(&content.overlay));
 
     let panel = Rc::new(Panel {
         win: win.clone(),
@@ -154,6 +190,7 @@ fn build_window(app: &adw::Application, toplevel: bool) {
             top: geom::EDGE_GAP,
         }),
         resize_origin: Cell::new(DEFAULT_SIZE),
+        drag_ignored: Cell::new(false),
         monitor: Cell::new((0, 0)),
         default_size: DEFAULT_SIZE,
         layered: !toplevel,
@@ -166,6 +203,7 @@ fn build_window(app: &adw::Application, toplevel: bool) {
         content.grip.set_visible(false);
     } else {
         wire_grip(&panel);
+        wire_right_button_resize(&panel, &content.root);
     }
     wire_signal(&panel, sig_rx);
 
@@ -266,7 +304,16 @@ fn wire_drag(panel: &Rc<Panel>, root: &gtk::Box) {
 
     {
         let panel = panel.clone();
-        drag.connect_drag_begin(move |_, _, _| {
+        let root_for_bounds = root.clone();
+        drag.connect_drag_begin(move |gesture, x, y| {
+            // Belt: refuse a sequence that began on the grip. The grip also
+            // claims it (braces) — either alone can lose to propagation order.
+            if in_grip(&panel.grip, &root_for_bounds, x, y) {
+                panel.drag_ignored.set(true);
+                gesture.set_state(gtk::EventSequenceState::Denied);
+                return;
+            }
+            panel.drag_ignored.set(false);
             panel.drag_origin.set(panel.margins.get());
         });
     }
@@ -274,7 +321,7 @@ fn wire_drag(panel: &Rc<Panel>, root: &gtk::Box) {
     {
         let panel = panel.clone();
         drag.connect_drag_update(move |_, dx, dy| {
-            if panel.pinned.get() || !panel.layered {
+            if panel.drag_ignored.get() || panel.pinned.get() || !panel.layered {
                 return;
             }
             let origin = panel.drag_origin.get();
@@ -292,7 +339,7 @@ fn wire_drag(panel: &Rc<Panel>, root: &gtk::Box) {
     {
         let panel = panel.clone();
         drag.connect_drag_end(move |_, _, _| {
-            if panel.pinned.get() || !panel.layered {
+            if panel.drag_ignored.get() || panel.pinned.get() || !panel.layered {
                 return;
             }
             let m = panel.margins.get();
@@ -305,13 +352,36 @@ fn wire_drag(panel: &Rc<Panel>, root: &gtk::Box) {
     root.add_controller(drag);
 }
 
+/// Is this point, in `origin`'s coordinate space, inside the grip?
+///
+/// `compute_bounds` translates between the two widgets explicitly, so this does
+/// not assume the grip and the root share an origin.
+fn in_grip(grip: &gtk::DrawingArea, origin: &gtk::Box, x: f64, y: f64) -> bool {
+    if !grip.is_visible() {
+        return false;
+    }
+
+    match grip.compute_bounds(origin) {
+        Some(r) => {
+            x >= r.x() as f64
+                && x <= (r.x() + r.width()) as f64
+                && y >= r.y() as f64
+                && y <= (r.y() + r.height()) as f64
+        }
+        None => false,
+    }
+}
+
 /// Resize from the bottom-right grip. Inert while pinned.
 fn wire_grip(panel: &Rc<Panel>) {
     let drag = gtk::GestureDrag::new();
 
     {
         let panel = panel.clone();
-        drag.connect_drag_begin(move |_, _, _| {
+        drag.connect_drag_begin(move |gesture, _, _| {
+            // Braces: take the sequence so the root's move gesture cannot also
+            // act on it.
+            gesture.set_state(gtk::EventSequenceState::Claimed);
             panel.resize_origin.set(panel.panel_size());
         });
     }
@@ -319,19 +389,52 @@ fn wire_grip(panel: &Rc<Panel>) {
     {
         let panel = panel.clone();
         drag.connect_drag_update(move |_, dx, dy| {
-            // set_size_request sets a MINIMUM, which would stop the compositor
-            // shrinking a toplevel window. Layer surfaces size themselves, so
-            // it is only correct there.
-            if panel.pinned.get() || !panel.layered {
-                return;
-            }
-            let (w0, h0) = panel.resize_origin.get();
-            let (w, h) = geom::clamp_size(w0 + dx as i32, h0 + dy as i32, panel.monitor.get());
-            panel.win.set_size_request(w, h);
+            resize_by(&panel, dx, dy, "resize-grip");
         });
     }
 
     panel.grip.add_controller(drag);
+}
+
+/// Right-button drag anywhere on the panel resizes it.
+///
+/// This is the primary gesture; the corner grip is the discoverable affordance
+/// for it.
+fn wire_right_button_resize(panel: &Rc<Panel>, root: &gtk::Box) {
+    let drag = gtk::GestureDrag::new();
+    drag.set_button(gtk::gdk::BUTTON_SECONDARY);
+
+    {
+        let panel = panel.clone();
+        drag.connect_drag_begin(move |gesture, _, _| {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            panel.resize_origin.set(panel.panel_size());
+        });
+    }
+
+    {
+        let panel = panel.clone();
+        drag.connect_drag_update(move |_, dx, dy| {
+            resize_by(&panel, dx, dy, "resize-rmb");
+        });
+    }
+
+    root.add_controller(drag);
+}
+
+/// Shared resize maths, plus the trace that shows whether it took effect.
+///
+/// `set_size_request` sets a MINIMUM, which would stop a compositor shrinking a
+/// toplevel window, so this is layer-mode only.
+fn resize_by(panel: &Rc<Panel>, dx: f64, dy: f64, phase: &'static str) {
+    if panel.pinned.get() || !panel.layered {
+        return;
+    }
+
+    let (w0, h0) = panel.resize_origin.get();
+    let (w, h) = geom::clamp_size(w0 + dx as i32, h0 + dy as i32, panel.monitor.get());
+    panel.win.set_size_request(w, h);
+    panel.debug_resize(phase, (w, h));
 }
 
 /// Drain the SIGUSR1 channel on the main thread and toggle the pin there.
