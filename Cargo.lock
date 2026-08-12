@@ -138,6 +138,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gnomon-bridge"
+version = "0.1.0"
+dependencies = [
+ "gnomon-core",
+ "serde_json",
+]
+
+[[package]]
 name = "gnomon-core"
 version = "0.1.0"
 dependencies = [

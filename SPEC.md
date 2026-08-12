@@ -24,9 +24,17 @@ Two transports. ONE schema. Both transports MUST deserialize into the same types
 ### B) Chrome extension bridge
 
 - The extension calls `claude.ai/api/organizations/{orgId}/usage` from inside the page.
-- The extension pushes results to a loopback listener owned by gnomon.
+- The extension delivers results over Chrome native messaging (stdio) to the
+  `com.gnomon.bridge` host. It MUST NOT use HTTP to reach gnomon.
+- The host forwards the raw payload to a Unix domain socket at
+  `$XDG_RUNTIME_DIR/gnomon/bridge.sock`.
+- gnomon opens no listening network socket, on loopback or otherwise. There is no port,
+  so the extension holds no gnomon secret and there is nothing to authenticate.
 - gnomon itself never reads a cookie.
-- Target interval: 30s.
+- Refresh is event-driven: on request completion, and on tab becoming visible. Heartbeat
+  60s while the tab is visible, 300s while hidden. Hard floor of 2s between fetches.
+- Transport A, at its 180s minimum, remains the ONLY source that observes Claude Code CLI
+  usage. Transport B observes browser usage only.
 
 ## Schema rules
 
@@ -51,10 +59,14 @@ Render one bar per entry in `limits[]`. Never hardcode a bar count.
 ## Security rules
 
 - No credential is ever logged, cached to disk, or written to a crash dump.
-- The loopback listener binds `127.0.0.1` only.
-- The loopback listener requires a shared token.
+- gnomon MUST NOT open a listening network socket, on loopback or otherwise.
+- IPC is a Unix domain socket at `$XDG_RUNTIME_DIR/gnomon/bridge.sock`, mode 0600, inside
+  a directory of mode 0700. Access control is filesystem permissions.
+- The extension holds no gnomon secret. There is no port to authenticate against.
 
 ## Unverified, do not build on
 
 - The meaning of `is_active`.
 - The server-side recompute granularity of `percent`.
+- Whether Chrome's Local Network Access prompt affects extension service workers. Native
+  messaging was chosen over loopback so the answer does not matter.

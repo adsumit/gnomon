@@ -5,7 +5,9 @@
 
 pub mod creds;
 pub mod error;
+pub mod ipc;
 pub mod model;
+pub mod nm;
 pub mod oauth;
 pub mod parse;
 mod wire;
