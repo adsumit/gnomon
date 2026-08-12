@@ -31,6 +31,13 @@ struct Panel {
     drag_ignored: Cell<bool>,
     /// Pointer is somewhere over the panel.
     hovered: Cell<bool>,
+    /// Size awaiting application, and the phase that requested it.
+    pending_size: Cell<Option<(i32, i32)>>,
+    pending_phase: Cell<&'static str>,
+    /// True while a flush is already scheduled for the next idle.
+    flush_queued: Cell<bool>,
+    /// Last size actually handed to the compositor.
+    last_applied: Cell<Option<(i32, i32)>>,
     monitor: Cell<(i32, i32)>,
     /// The size the window was configured with, valid before allocation.
     default_size: (i32, i32),
@@ -53,6 +60,22 @@ impl Panel {
             self.win.set_margin(Edge::Top, m.top);
         }
         self.debug_geom(phase, size, size_source);
+    }
+
+    /// Apply the most recent pending size, once.
+    fn flush_resize(self: &Rc<Self>) {
+        self.flush_queued.set(false);
+
+        let Some(size) = self.pending_size.take() else {
+            return;
+        };
+        if self.last_applied.get() == Some(size) {
+            return;
+        }
+
+        self.last_applied.set(Some(size));
+        self.win.set_default_size(size.0, size.1);
+        self.debug_resize(self.pending_phase.get(), size);
     }
 
     /// Trace a resize request and, once layout has run, what it actually got.
@@ -157,6 +180,10 @@ fn build_window(app: &adw::Application, toplevel: bool) {
         .title("gnomon")
         .build();
 
+    // A layer surface negotiates from the default size; the size request must
+    // never become a floor under it.
+    win.set_size_request(1, 1);
+
     if !toplevel {
         // Scopes the transparency rule, so --toplevel keeps a solid window.
         win.add_css_class("gnomon-layer");
@@ -194,6 +221,10 @@ fn build_window(app: &adw::Application, toplevel: bool) {
         resize_origin: Cell::new(DEFAULT_SIZE),
         drag_ignored: Cell::new(false),
         hovered: Cell::new(false),
+        pending_size: Cell::new(None),
+        pending_phase: Cell::new("resize"),
+        flush_queued: Cell::new(false),
+        last_applied: Cell::new(None),
         monitor: Cell::new((0, 0)),
         default_size: DEFAULT_SIZE,
         layered: !toplevel,
@@ -462,19 +493,35 @@ fn wire_right_button_resize(panel: &Rc<Panel>, root: &gtk::Box) {
     root.add_controller(drag);
 }
 
-/// Shared resize maths, plus the trace that shows whether it took effect.
+/// Shared resize maths. Layer-mode only; the compositor owns a toplevel's size.
 ///
-/// `set_size_request` sets a MINIMUM, which would stop a compositor shrinking a
-/// toplevel window, so this is layer-mode only.
+/// A layer surface negotiates from the window's *default* size, so
+/// `set_default_size` is the lever. `set_size_request` only sets a minimum,
+/// which is why it produced a hard 300x150 floor.
+///
+/// The size is not applied here. It is stashed and flushed once on the next
+/// idle, so a burst of drag-update events becomes one reconfigure.
 fn resize_by(panel: &Rc<Panel>, dx: f64, dy: f64, phase: &'static str) {
     if panel.pinned.get() || !panel.layered {
         return;
     }
 
     let (w0, h0) = panel.resize_origin.get();
-    let (w, h) = geom::clamp_size(w0 + dx as i32, h0 + dy as i32, panel.monitor.get());
-    panel.win.set_size_request(w, h);
-    panel.debug_resize(phase, (w, h));
+    let size = geom::clamp_size(w0 + dx as i32, h0 + dy as i32, panel.monitor.get());
+
+    // (a) Never re-apply a size the compositor already has.
+    if panel.last_applied.get() == Some(size) {
+        return;
+    }
+
+    panel.pending_size.set(Some(size));
+    panel.pending_phase.set(phase);
+
+    // (b) Coalesce: at most one reconfigure per idle turn.
+    if !panel.flush_queued.replace(true) {
+        let panel = panel.clone();
+        glib::idle_add_local_once(move || panel.flush_resize());
+    }
 }
 
 /// Drain the SIGUSR1 channel on the main thread and toggle the pin there.

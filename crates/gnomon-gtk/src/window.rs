@@ -98,8 +98,12 @@ pub fn build() -> Content {
         .vscrollbar_policy(gtk::PolicyType::External)
         .propagate_natural_width(false)
         .propagate_natural_height(false)
+        // No momentum panning from a touch drag.
+        .kinetic_scrolling(false)
         .child(&root)
         .build();
+
+    block_scrolling(&scrolled);
 
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&scrolled));
@@ -213,6 +217,20 @@ fn watch_width(
     // previously orphaned the probe on the first snapshot and silently killed
     // the responsive mode.
     overlay.add_overlay(&probe);
+}
+
+/// Swallow scroll events before the ScrolledWindow can pan.
+///
+/// The ScrolledWindow exists only to stop natural content size acting as a
+/// floor on the surface; panning is never wanted. A Capture-phase scroll
+/// controller sees events before the scrolled window does and stops them, which
+/// covers the wheel and touchpad. Kinetic scrolling is off, so a touch drag
+/// cannot fling it either.
+fn block_scrolling(scrolled: &gtk::ScrolledWindow) {
+    let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+    scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+    scroll.connect_scroll(|_, _, _| glib::Propagation::Stop);
+    scrolled.add_controller(scroll);
 }
 
 /// Three dots stepping up the diagonal, in the theme's foreground colour.

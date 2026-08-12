@@ -5,8 +5,6 @@
 
 /// An edge closer than this to the monitor's edge snaps to it.
 pub const SNAP_THRESHOLD: i32 = 48;
-/// At least this much of the panel stays on screen on every side.
-pub const MIN_VISIBLE: i32 = 48;
 /// The gap a snapped edge settles at.
 pub const EDGE_GAP: i32 = 12;
 
@@ -35,24 +33,23 @@ pub fn initial_margins(panel: (i32, i32), monitor: (i32, i32)) -> Margins {
     clamp_margins(raw.left, raw.top, panel, monitor)
 }
 
-/// Keep at least [`MIN_VISIBLE`] pixels of the panel on screen on every side.
+/// Keep the panel entirely on screen.
 ///
-/// The lower bound is negative by design: the panel may hang off the left or
-/// top, so long as a sliver remains reachable.
+/// Allowing it to hang off an edge made release-time snapping look like a yank:
+/// the panel would sit half off the bottom during the drag, then jump fully
+/// back. Constraining the drag itself makes snap a small correction instead.
 pub fn clamp_margins(left: i32, top: i32, panel: (i32, i32), monitor: (i32, i32)) -> Margins {
     let (panel_w, panel_h) = panel;
     let (mon_w, mon_h) = monitor;
 
-    let min_left = MIN_VISIBLE - panel_w;
-    let max_left = mon_w - MIN_VISIBLE;
-    let min_top = MIN_VISIBLE - panel_h;
-    let max_top = mon_h - MIN_VISIBLE;
+    let max_left = mon_w - panel_w;
+    let max_top = mon_h - panel_h;
 
     Margins {
-        // `max` first: on a monitor narrower than the panel the bounds cross,
-        // and clamping must not produce a value above `min_left`.
-        left: left.clamp(min_left.min(max_left), max_left),
-        top: top.clamp(min_top.min(max_top), max_top),
+        // A panel larger than the monitor crosses the bounds, so `min` keeps
+        // the lower edge authoritative rather than producing a value above it.
+        left: left.clamp(0.min(max_left), max_left.max(0)),
+        top: top.clamp(0.min(max_top), max_top.max(0)),
     }
 }
 
@@ -130,7 +127,7 @@ mod tests {
             "initial_margins must return an already-clamped position"
         );
         assert!(
-            m.left <= MONITOR.0 - MIN_VISIBLE,
+            m.left <= MONITOR.0,
             "left {} would put the panel off the right edge",
             m.left
         );
@@ -140,28 +137,39 @@ mod tests {
 
     #[test]
     fn clamp_past_left_edge() {
-        // Dragged far off the left; 48px of the panel must remain.
+        // The panel must stay fully on screen, so it stops flush at 0.
         let m = clamp_margins(-1000, 100, PANEL, MONITOR);
-        assert_eq!(m.left, MIN_VISIBLE - PANEL.0); // -252
+        assert_eq!(m.left, 0);
         assert_eq!(m.top, 100, "the other axis is untouched");
     }
 
     #[test]
     fn clamp_past_right_edge() {
         let m = clamp_margins(9999, 100, PANEL, MONITOR);
-        assert_eq!(m.left, MONITOR.0 - MIN_VISIBLE); // 1872
+        assert_eq!(m.left, MONITOR.0 - PANEL.0); // 1620, right edge flush
     }
 
     #[test]
     fn clamp_past_top_edge() {
         let m = clamp_margins(100, -1000, PANEL, MONITOR);
-        assert_eq!(m.top, MIN_VISIBLE - PANEL.1); // -102
+        assert_eq!(m.top, 0);
     }
 
     #[test]
     fn clamp_past_bottom_edge() {
         let m = clamp_margins(100, 9999, PANEL, MONITOR);
-        assert_eq!(m.top, MONITOR.1 - MIN_VISIBLE); // 1032
+        assert_eq!(m.top, MONITOR.1 - PANEL.1); // 930, bottom edge flush
+    }
+
+    #[test]
+    fn clamp_keeps_an_oversized_panel_at_the_origin() {
+        // Taller and wider than the monitor: the bounds cross, and the result
+        // must still be the top-left corner rather than a positive offset.
+        let huge = (3000, 2000);
+        assert_eq!(
+            clamp_margins(500, 500, huge, MONITOR),
+            Margins { left: 0, top: 0 }
+        );
     }
 
     #[test]
