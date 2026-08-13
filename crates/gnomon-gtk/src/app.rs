@@ -15,6 +15,9 @@ const APP_ID: &str = "com.gnomon.Gnomon";
 /// allocation makes a real measurement available.
 const DEFAULT_SIZE: (i32, i32) = (300, 150);
 const STYLE: &str = include_str!("style.css");
+/// Frames to wait for an allocation before assuming the request was ignored.
+/// Without this, one unacknowledged request would freeze resizing for good.
+const IN_FLIGHT_TIMEOUT_FRAMES: u32 = 8;
 
 /// Everything the gestures and the signal handler need to share.
 struct Panel {
@@ -31,13 +34,20 @@ struct Panel {
     drag_ignored: Cell<bool>,
     /// Pointer is somewhere over the panel.
     hovered: Cell<bool>,
-    /// Size awaiting application, and the phase that requested it.
-    pending_size: Cell<Option<(i32, i32)>>,
-    pending_phase: Cell<&'static str>,
-    /// True while a flush is already scheduled for the next idle.
-    flush_queued: Cell<bool>,
-    /// Last size actually handed to the compositor.
-    last_applied: Cell<Option<(i32, i32)>>,
+    /// Size the drag currently wants. Updated freely, applied at most once per
+    /// frame by the tick callback.
+    target: Cell<Option<(i32, i32)>>,
+    /// A request handed to the compositor that has not yet come back as an
+    /// allocation. While set, no new request is issued.
+    in_flight: Cell<Option<(i32, i32)>>,
+    /// Frames elapsed since `in_flight` was set, for the stuck-state timeout.
+    in_flight_frames: Cell<u32>,
+    /// Most recent request, for comparing against an arriving allocation.
+    last_requested: Cell<Option<(i32, i32)>>,
+    /// Most recent size the probe actually reported.
+    last_allocated: Cell<Option<(i32, i32)>>,
+    /// Phase label for the trace.
+    resize_phase: Cell<&'static str>,
     monitor: Cell<(i32, i32)>,
     /// The size the window was configured with, valid before allocation.
     default_size: (i32, i32),
@@ -62,53 +72,116 @@ impl Panel {
         self.debug_geom(phase, size, size_source);
     }
 
-    /// Apply the most recent pending size, once.
-    fn flush_resize(self: &Rc<Self>) {
-        self.flush_queued.set(false);
-
-        let Some(size) = self.pending_size.take() else {
-            return;
-        };
-        if self.last_applied.get() == Some(size) {
+    /// Issue at most one size request, called once per frame.
+    ///
+    /// Returns without acting unless there is a target, nothing is in flight,
+    /// and the target actually differs from what is already on screen.
+    fn tick_resize(self: &Rc<Self>) {
+        if self.pinned.get() || !self.layered {
             return;
         }
 
-        self.last_applied.set(Some(size));
-        self.win.set_default_size(size.0, size.1);
-        self.debug_resize(self.pending_phase.get(), size);
+        // Stuck-state timeout. A request that never produces an allocation
+        // change — because the compositor clamped it, or because the size it
+        // settled on happens to equal the previous one — would otherwise leave
+        // `in_flight` set forever and freeze resizing permanently.
+        if self.in_flight.get().is_some() {
+            let frames = self.in_flight_frames.get() + 1;
+            self.in_flight_frames.set(frames);
+            if frames < IN_FLIGHT_TIMEOUT_FRAMES {
+                return;
+            }
+            self.debug_resize_timeout();
+            self.in_flight.set(None);
+            self.in_flight_frames.set(0);
+        }
+
+        let Some(target) = self.target.get() else {
+            return;
+        };
+
+        // Equality escape: never request a size the surface already has, which
+        // is the case most likely to produce no allocation at all.
+        if self.last_allocated.get() == Some(target) {
+            self.target.set(None);
+            return;
+        }
+
+        self.in_flight.set(Some(target));
+        self.in_flight_frames.set(0);
+        self.last_requested.set(Some(target));
+        self.win.set_default_size(target.0, target.1);
+        self.debug_resize_request(target);
     }
 
-    /// Trace a resize request and, once layout has run, what it actually got.
+    /// An allocation arrived: the surface has genuinely changed size.
     ///
-    /// Reading the allocation immediately would only report the pre-resize
-    /// size, so the follow-up runs on the next idle. The pair distinguishes
-    /// "the gesture never fired" from "it fired and the surface refused".
-    fn debug_resize(self: &Rc<Self>, phase: &'static str, requested: (i32, i32)) {
+    /// This is the only place `in_flight` is cleared on the success path, and
+    /// the only honest place to measure the settled size — an idle callback
+    /// runs before the compositor's configure lands and reads a stale value,
+    /// which is what produced the bogus mismatch markers.
+    fn on_allocation(self: &Rc<Self>, width: i32, height: i32) {
+        let allocated = (width, height);
+        self.last_allocated.set(Some(allocated));
+        self.in_flight.set(None);
+        self.in_flight_frames.set(0);
+
+        if self.target.get() == Some(allocated) {
+            self.target.set(None);
+        }
+
+        self.debug_resize_allocated(allocated);
+    }
+
+    fn debug_resize_request(&self, requested: (i32, i32)) {
         if std::env::var_os("GNOMON_DEBUG_GEOM").is_none() {
             return;
         }
-        let before = self.panel_size();
         eprintln!(
-            "gnomon geom[{phase}]: requested={}x{} allocated_before={}x{}",
-            requested.0, requested.1, before.0, before.1,
+            "gnomon geom[{}]: requested={}x{}",
+            self.resize_phase.get(),
+            requested.0,
+            requested.1,
         );
+    }
 
-        let panel = self.clone();
-        glib::idle_add_local_once(move || {
-            let after = panel.panel_size();
+    /// Compare only against the MOST RECENT request. Comparing against a
+    /// superseded one is what generated the false mismatch markers.
+    fn debug_resize_allocated(&self, allocated: (i32, i32)) {
+        if std::env::var_os("GNOMON_DEBUG_GEOM").is_none() {
+            return;
+        }
+        let Some(requested) = self.last_requested.get() else {
+            return;
+        };
+        eprintln!(
+            "gnomon geom[{}-allocated]: requested={}x{} allocated={}x{}{}",
+            self.resize_phase.get(),
+            requested.0,
+            requested.1,
+            allocated.0,
+            allocated.1,
+            if allocated == requested {
+                ""
+            } else {
+                "  <-- differs from the latest request"
+            },
+        );
+    }
+
+    fn debug_resize_timeout(&self) {
+        if std::env::var_os("GNOMON_DEBUG_GEOM").is_none() {
+            return;
+        }
+        if let Some(req) = self.in_flight.get() {
             eprintln!(
-                "gnomon geom[{phase}-settled]: requested={}x{} allocated_after={}x{}{}",
-                requested.0,
-                requested.1,
-                after.0,
-                after.1,
-                if after == requested {
-                    ""
-                } else {
-                    "  <-- SURFACE DID NOT TAKE THE REQUESTED SIZE"
-                },
+                "gnomon geom[{}-timeout]: no allocation for {}x{} after {} frames, releasing",
+                self.resize_phase.get(),
+                req.0,
+                req.1,
+                IN_FLIGHT_TIMEOUT_FRAMES,
             );
-        });
+        }
     }
 
     /// Unconditional geometry trace, behind `GNOMON_DEBUG_GEOM`.
@@ -221,23 +294,42 @@ fn build_window(app: &adw::Application, toplevel: bool) {
         resize_origin: Cell::new(DEFAULT_SIZE),
         drag_ignored: Cell::new(false),
         hovered: Cell::new(false),
-        pending_size: Cell::new(None),
-        pending_phase: Cell::new("resize"),
-        flush_queued: Cell::new(false),
-        last_applied: Cell::new(None),
+        target: Cell::new(None),
+        in_flight: Cell::new(None),
+        in_flight_frames: Cell::new(0),
+        last_requested: Cell::new(None),
+        last_allocated: Cell::new(None),
+        resize_phase: Cell::new("resize"),
         monitor: Cell::new((0, 0)),
         default_size: DEFAULT_SIZE,
         layered: !toplevel,
     });
 
+    // One request per frame, decided by the flow control in tick_resize.
+    {
+        let panel = panel.clone();
+        win.add_tick_callback(move |_, _| {
+            panel.tick_resize();
+            glib::ControlFlow::Continue
+        });
+    }
+
+    // The probe's resize signal is the real "the surface changed size" event.
+    {
+        let panel = panel.clone();
+        content.probe.connect_resize(move |_, width, height| {
+            panel.on_allocation(width, height);
+        });
+    }
+
     wire_drag(&panel, &content.root);
     if !toplevel {
         // In toplevel mode the compositor provides resize handles; ours would
         // only fight it by pinning a minimum size.
-        wire_grip(&panel);
+        wire_grip(&panel, content.set_resizing.clone());
         // Independent of the grip: right-drag resizes whether or not the grip
         // is currently revealed.
-        wire_right_button_resize(&panel, &content.root);
+        wire_right_button_resize(&panel, &content.root, content.set_resizing.clone());
     }
     wire_hover(&panel, &content.overlay);
     update_grip_visibility(&panel);
@@ -444,16 +536,18 @@ fn in_grip(grip: &gtk::DrawingArea, origin: &gtk::Box, x: f64, y: f64) -> bool {
 }
 
 /// Resize from the bottom-right grip. Inert while pinned.
-fn wire_grip(panel: &Rc<Panel>) {
+fn wire_grip(panel: &Rc<Panel>, set_resizing: Rc<dyn Fn(bool)>) {
     let drag = gtk::GestureDrag::new();
 
     {
         let panel = panel.clone();
+        let set_resizing = set_resizing.clone();
         drag.connect_drag_begin(move |gesture, _, _| {
             // Braces: take the sequence so the root's move gesture cannot also
             // act on it.
             gesture.set_state(gtk::EventSequenceState::Claimed);
             panel.resize_origin.set(panel.panel_size());
+            set_resizing(true);
         });
     }
 
@@ -464,6 +558,8 @@ fn wire_grip(panel: &Rc<Panel>) {
         });
     }
 
+    drag.connect_drag_end(move |_, _, _| set_resizing(false));
+
     panel.grip.add_controller(drag);
 }
 
@@ -471,15 +567,21 @@ fn wire_grip(panel: &Rc<Panel>) {
 ///
 /// This is the primary gesture; the corner grip is the discoverable affordance
 /// for it.
-fn wire_right_button_resize(panel: &Rc<Panel>, root: &gtk::Box) {
+fn wire_right_button_resize(
+    panel: &Rc<Panel>,
+    root: &gtk::Box,
+    set_resizing: Rc<dyn Fn(bool)>,
+) {
     let drag = gtk::GestureDrag::new();
     drag.set_button(gtk::gdk::BUTTON_SECONDARY);
 
     {
         let panel = panel.clone();
+        let set_resizing = set_resizing.clone();
         drag.connect_drag_begin(move |gesture, _, _| {
             gesture.set_state(gtk::EventSequenceState::Claimed);
             panel.resize_origin.set(panel.panel_size());
+            set_resizing(true);
         });
     }
 
@@ -490,6 +592,8 @@ fn wire_right_button_resize(panel: &Rc<Panel>, root: &gtk::Box) {
         });
     }
 
+    drag.connect_drag_end(move |_, _, _| set_resizing(false));
+
     root.add_controller(drag);
 }
 
@@ -499,8 +603,8 @@ fn wire_right_button_resize(panel: &Rc<Panel>, root: &gtk::Box) {
 /// `set_default_size` is the lever. `set_size_request` only sets a minimum,
 /// which is why it produced a hard 300x150 floor.
 ///
-/// The size is not applied here. It is stashed and flushed once on the next
-/// idle, so a burst of drag-update events becomes one reconfigure.
+/// A drag-update only records the desired size. The frame clock decides when
+/// to ask for it, and the flow control decides whether to ask at all.
 fn resize_by(panel: &Rc<Panel>, dx: f64, dy: f64, phase: &'static str) {
     if panel.pinned.get() || !panel.layered {
         return;
@@ -509,19 +613,8 @@ fn resize_by(panel: &Rc<Panel>, dx: f64, dy: f64, phase: &'static str) {
     let (w0, h0) = panel.resize_origin.get();
     let size = geom::clamp_size(w0 + dx as i32, h0 + dy as i32, panel.monitor.get());
 
-    // (a) Never re-apply a size the compositor already has.
-    if panel.last_applied.get() == Some(size) {
-        return;
-    }
-
-    panel.pending_size.set(Some(size));
-    panel.pending_phase.set(phase);
-
-    // (b) Coalesce: at most one reconfigure per idle turn.
-    if !panel.flush_queued.replace(true) {
-        let panel = panel.clone();
-        glib::idle_add_local_once(move || panel.flush_resize());
-    }
+    panel.resize_phase.set(phase);
+    panel.target.set(Some(size));
 }
 
 /// Drain the SIGUSR1 channel on the main thread and toggle the pin there.

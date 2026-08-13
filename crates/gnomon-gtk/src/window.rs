@@ -10,12 +10,9 @@ use gtk::prelude::*;
 
 use crate::feed::{self, Update};
 
+use crate::geom;
+
 const SEVERITY_CLASSES: [&str; 3] = ["sev-normal", "sev-warning", "sev-error"];
-/// Below this width the panel drops the countdowns and the decimal place.
-const COMPACT_WIDTH: i32 = 240;
-/// Below either of these the panel also tightens its padding and spacing.
-const TIGHT_WIDTH: i32 = 200;
-const TIGHT_HEIGHT: i32 = 150;
 /// Root box spacing, normal and tightened.
 const SPACING: i32 = 14;
 const SPACING_TIGHT: i32 = 6;
@@ -42,6 +39,12 @@ pub struct Content {
     pub overlay: gtk::Overlay,
     pub root: gtk::Box,
     pub grip: gtk::DrawingArea,
+    /// Fires on every real allocation. app.rs uses it as the resize
+    /// acknowledgement; window.rs uses it for the responsive thresholds.
+    pub probe: gtk::DrawingArea,
+    /// Called with true when an interactive resize starts and false when it
+    /// ends, so the expensive rebuild can be deferred to the end.
+    pub set_resizing: Rc<dyn Fn(bool)>,
 }
 
 /// Build the content tree, start the feed, and wire up updates.
@@ -110,7 +113,7 @@ pub fn build() -> Content {
 
     render(&root, &status, &state);
     debug_css_on_realize(&root);
-    watch_width(&overlay, &root, &status, &state);
+    let (probe, set_resizing) = watch_width(&overlay, &root, &status, &state);
 
     // Added last so the grip sits above the probe.
     overlay.add_overlay(&grip);
@@ -158,6 +161,8 @@ pub fn build() -> Content {
         overlay,
         root,
         grip,
+        probe,
+        set_resizing,
     }
 }
 
@@ -172,7 +177,7 @@ fn watch_width(
     root: &gtk::Box,
     status: &gtk::Label,
     state: &Rc<RefCell<State>>,
-) {
+) -> (gtk::DrawingArea, Rc<dyn Fn(bool)>) {
     // Fills the overlay so its `resize` signal reports both dimensions.
     let probe = gtk::DrawingArea::builder()
         .content_width(0)
@@ -184,39 +189,77 @@ fn watch_width(
 
     let last_compact = Rc::new(Cell::new(false));
     let last_tight = Rc::new(Cell::new(false));
-    let root_c = root.clone();
-    let status_c = status.clone();
-    let state_c = state.clone();
+    // Compact state the allocation implies, which may not be on screen yet
+    // because a resize is in progress.
+    let wanted_compact = Rc::new(Cell::new(false));
+    let resizing = Rc::new(Cell::new(false));
 
-    probe.connect_resize(move |_, width, height| {
-        let compact = width > 0 && width < COMPACT_WIDTH;
-        let tight =
-            (width > 0 && width < TIGHT_WIDTH) || (height > 0 && height < TIGHT_HEIGHT);
+    {
+        let root_c = root.clone();
+        let status_c = status.clone();
+        let state_c = state.clone();
+        let last_compact = last_compact.clone();
+        let last_tight = last_tight.clone();
+        let wanted_compact = wanted_compact.clone();
+        let resizing = resizing.clone();
 
-        // Padding and spacing: no rebuild needed, just restyle.
-        if tight != last_tight.get() {
-            last_tight.set(tight);
-            if tight {
-                root_c.add_css_class("compact");
-                root_c.set_spacing(SPACING_TIGHT);
-            } else {
-                root_c.remove_css_class("compact");
-                root_c.set_spacing(SPACING);
+        probe.connect_resize(move |_, width, height| {
+            let (compact, tight) =
+                geom::responsive_state(width, height, last_compact.get(), last_tight.get());
+
+            // Restyling is cheap, so it stays live during a drag.
+            if tight != last_tight.get() {
+                last_tight.set(tight);
+                apply_tight(&root_c, tight);
             }
-        }
 
-        // Label content: this one does need a rebuild.
-        if compact != last_compact.get() {
-            last_compact.set(compact);
-            state_c.borrow_mut().compact = compact;
-            render(&root_c, &status_c, &state_c);
-        }
-    });
+            // Rebuilding every widget is not cheap. Mid-drag it is the most
+            // visible cost per frame, so it waits for the drag to end.
+            wanted_compact.set(compact);
+            if !resizing.get() && compact != last_compact.get() {
+                last_compact.set(compact);
+                state_c.borrow_mut().compact = compact;
+                render(&root_c, &status_c, &state_c);
+            }
+        });
+    }
 
     // An overlay child, not a box child: render() clears the box, which
     // previously orphaned the probe on the first snapshot and silently killed
     // the responsive mode.
     overlay.add_overlay(&probe);
+
+    let set_resizing: Rc<dyn Fn(bool)> = {
+        let root_c = root.clone();
+        let status_c = status.clone();
+        let state_c = state.clone();
+        Rc::new(move |active: bool| {
+            resizing.set(active);
+            if active {
+                return;
+            }
+            // Drag over: settle whatever the last allocation implied.
+            let compact = wanted_compact.get();
+            if compact != last_compact.get() {
+                last_compact.set(compact);
+                state_c.borrow_mut().compact = compact;
+                render(&root_c, &status_c, &state_c);
+            }
+        })
+    };
+
+    (probe, set_resizing)
+}
+
+/// Tightened padding and spacing for a small panel.
+fn apply_tight(root: &gtk::Box, tight: bool) {
+    if tight {
+        root.add_css_class("compact");
+        root.set_spacing(SPACING_TIGHT);
+    } else {
+        root.remove_css_class("compact");
+        root.set_spacing(SPACING);
+    }
 }
 
 /// Swallow scroll events before the ScrolledWindow can pan.

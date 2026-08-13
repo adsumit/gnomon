@@ -87,6 +87,47 @@ pub fn snap_margins(left: i32, top: i32, panel: (i32, i32), monitor: (i32, i32))
     }
 }
 
+// Responsive thresholds. Enter and exit differ so a drag hovering near a
+// boundary cannot oscillate: crossing in and crossing back out need different
+// widths, and the gap between them is a dead band where nothing changes.
+pub const COMPACT_ENTER_W: i32 = 240;
+pub const COMPACT_EXIT_W: i32 = 252;
+pub const TIGHT_ENTER_W: i32 = 200;
+pub const TIGHT_EXIT_W: i32 = 212;
+pub const TIGHT_ENTER_H: i32 = 150;
+pub const TIGHT_EXIT_H: i32 = 162;
+
+/// Decide the responsive flags from an allocation, with hysteresis.
+///
+/// Pure, so the oscillation behaviour is testable without a display. Returns
+/// `(compact, tight)`; an unallocated size leaves both unchanged.
+pub fn responsive_state(
+    width: i32,
+    height: i32,
+    compact: bool,
+    tight: bool,
+) -> (bool, bool) {
+    if width <= 0 || height <= 0 {
+        return (compact, tight);
+    }
+
+    let compact = if compact {
+        // Stay compact until comfortably clear of the entry threshold.
+        width <= COMPACT_EXIT_W
+    } else {
+        width < COMPACT_ENTER_W
+    };
+
+    let tight = if tight {
+        // Both axes must clear their exit thresholds to leave tight mode.
+        !(width > TIGHT_EXIT_W && height > TIGHT_EXIT_H)
+    } else {
+        width < TIGHT_ENTER_W || height < TIGHT_ENTER_H
+    };
+
+    (compact, tight)
+}
+
 /// Clamp a grip-driven size to the allowed range.
 pub fn clamp_size(width: i32, height: i32, monitor: (i32, i32)) -> (i32, i32) {
     (
@@ -245,6 +286,68 @@ mod tests {
     }
 
     // ---- size ----
+
+    // ---- responsive hysteresis ----
+
+    #[test]
+    fn compact_enters_below_the_entry_threshold() {
+        assert!(responsive_state(239, 400, false, false).0);
+        assert!(
+            !responsive_state(240, 400, false, false).0,
+            "the entry threshold itself is not below it"
+        );
+    }
+
+    #[test]
+    fn compact_leaves_only_above_the_exit_threshold() {
+        // Already compact: 245 is past the entry threshold but inside the dead
+        // band, so it must stay compact.
+        assert!(responsive_state(245, 400, true, false).0);
+        assert!(responsive_state(252, 400, true, false).0);
+        assert!(!responsive_state(253, 400, true, false).0);
+    }
+
+    #[test]
+    fn compact_dead_band_holds_both_states() {
+        // The same width yields a different answer depending on where it came
+        // from — that is the whole point of hysteresis.
+        for width in [241, 246, 252] {
+            assert!(responsive_state(width, 400, true, false).0);
+            assert!(!responsive_state(width, 400, false, false).0);
+        }
+    }
+
+    #[test]
+    fn tight_enters_on_either_axis() {
+        assert!(responsive_state(199, 400, false, false).1);
+        assert!(responsive_state(400, 149, false, false).1);
+        assert!(!responsive_state(400, 400, false, false).1);
+    }
+
+    #[test]
+    fn tight_leaves_only_when_both_axes_clear() {
+        // Width clear, height still inside: stays tight.
+        assert!(responsive_state(300, 155, false, true).1);
+        // Height clear, width still inside: stays tight.
+        assert!(responsive_state(205, 300, false, true).1);
+        // Both clear: leaves.
+        assert!(!responsive_state(213, 163, false, true).1);
+    }
+
+    #[test]
+    fn tight_dead_band_holds_both_states() {
+        for (w, h) in [(205, 155), (212, 162)] {
+            assert!(responsive_state(w, h, false, true).1);
+            assert!(!responsive_state(w, h, false, false).1);
+        }
+    }
+
+    #[test]
+    fn unallocated_size_changes_nothing() {
+        assert_eq!(responsive_state(0, 0, true, true), (true, true));
+        assert_eq!(responsive_state(0, 0, false, false), (false, false));
+        assert_eq!(responsive_state(300, 0, false, false), (false, false));
+    }
 
     #[test]
     fn clamp_size_respects_bounds() {
