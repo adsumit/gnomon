@@ -32,6 +32,11 @@ struct Panel {
     drag_zone: Cell<geom::Zone>,
     /// Surface-local point where the drag began.
     grab: Cell<(f64, f64)>,
+    /// Last point and zone the motion controller saw, purely for the
+    /// drag-begin trace: printing both on one line is what exposes a
+    /// coordinate-space disagreement between the two paths.
+    last_motion: Cell<(f64, f64)>,
+    last_motion_zone: Cell<geom::Zone>,
     /// Size the drag currently wants. Updated freely, applied at most once per
     /// frame by the tick callback.
     target: Cell<Option<(i32, i32)>>,
@@ -240,6 +245,28 @@ impl Panel {
         }
     }
 
+    /// What the drag gesture decided, beside what the motion controller
+    /// decided. If the two disagree they are not measuring the same rectangle.
+    fn debug_drag_begin(&self, x: f64, y: f64, size: (i32, i32), zone: geom::Zone) {
+        if std::env::var_os("GNOMON_DEBUG_GEOM").is_none() {
+            return;
+        }
+        let (mx, my) = self.last_motion.get();
+        eprintln!(
+            "gnomon geom[drag-begin]: gesture=({:.1},{:.1}) size={}x{} zone={:?} mode={} \
+| motion=({:.1},{:.1}) zone={:?}",
+            x,
+            y,
+            size.0,
+            size.1,
+            zone,
+            if zone.is_resize() { "resize" } else { "move" },
+            mx,
+            my,
+            self.last_motion_zone.get(),
+        );
+    }
+
     /// Unconditional geometry trace, behind `GNOMON_DEBUG_GEOM`.
     fn debug_geom(&self, phase: &str, size: (i32, i32), size_source: &str) {
         if std::env::var_os("GNOMON_DEBUG_GEOM").is_none() {
@@ -349,6 +376,8 @@ fn build_window(app: &adw::Application, toplevel: bool) {
         resize_origin: Cell::new(DEFAULT_SIZE),
         drag_zone: Cell::new(geom::Zone::None),
         grab: Cell::new((0.0, 0.0)),
+        last_motion: Cell::new((-1.0, -1.0)),
+        last_motion_zone: Cell::new(geom::Zone::None),
         target: Cell::new(None),
         in_flight: Cell::new(None),
         in_flight_frames: Cell::new(0),
@@ -377,10 +406,13 @@ fn build_window(app: &adw::Application, toplevel: bool) {
         });
     }
 
-    wire_drag(&panel, &content.root, content.set_resizing.clone());
+    // Every pointer path is attached to the overlay so they share one
+    // coordinate space, and all of them measure against the window's own size.
+    wire_drag(&panel, &content.overlay, content.set_resizing.clone());
     if !toplevel {
-        // In toplevel mode the compositor owns resizing entirely.
-        wire_right_button_resize(&panel, &content.root, content.set_resizing.clone());
+        // In toplevel mode the compositor owns resizing entirely, so neither
+        // the resize gesture nor its cursors belong here.
+        wire_right_button_resize(&panel, &content.overlay, content.set_resizing.clone());
         wire_cursor(&panel, &content.overlay);
     }
     wire_signal(&panel, sig_rx);
@@ -478,8 +510,13 @@ fn watch_surface(panel: &Rc<Panel>, win: &adw::ApplicationWindow) {
 
 /// One gesture, two modes. The mode is decided at drag-begin from the zone
 /// under the press and never changes for the rest of the sequence.
-fn wire_drag(panel: &Rc<Panel>, root: &gtk::Box, set_resizing: Rc<dyn Fn(bool)>) {
+fn wire_drag(panel: &Rc<Panel>, overlay: &gtk::Overlay, set_resizing: Rc<dyn Fn(bool)>) {
     let drag = gtk::GestureDrag::new();
+    drag.set_button(gtk::gdk::BUTTON_PRIMARY);
+    // Capture: see the press before any child can consume it. The 8px band sits
+    // over the ScrolledWindow and the root box, either of which could otherwise
+    // take the sequence first.
+    drag.set_propagation_phase(gtk::PropagationPhase::Capture);
 
     {
         let panel = panel.clone();
@@ -490,7 +527,10 @@ fn wire_drag(panel: &Rc<Panel>, root: &gtk::Box, set_resizing: Rc<dyn Fn(bool)>)
                 return;
             }
 
-            let zone = geom::zone_at(x as i32, y as i32, panel.panel_size());
+            let size = panel.panel_size();
+            let zone = geom::zone_at(x as i32, y as i32, size);
+            panel.debug_drag_begin(x, y, size, zone);
+
             panel.drag_zone.set(zone);
             panel.grab.set((x, y));
             panel.drag_origin.set(panel.margins.get());
@@ -539,7 +579,7 @@ fn wire_drag(panel: &Rc<Panel>, root: &gtk::Box, set_resizing: Rc<dyn Fn(bool)>)
         });
     }
 
-    root.add_controller(drag);
+    overlay.add_controller(drag);
 }
 
 /// Track the pointer and show the matching resize cursor.
@@ -554,6 +594,9 @@ fn wire_cursor(panel: &Rc<Panel>, overlay: &gtk::Overlay) {
                 return;
             }
             let zone = geom::zone_at(x as i32, y as i32, panel.panel_size());
+            panel.last_motion.set((x, y));
+            panel.last_motion_zone.set(zone);
+
             match zone.cursor_name() {
                 Some(name) => panel.win.set_cursor_from_name(Some(name)),
                 None => panel.win.set_cursor(None),
@@ -574,11 +617,14 @@ fn wire_cursor(panel: &Rc<Panel>, overlay: &gtk::Overlay) {
 /// The edge zones are only 8px, so this stays the forgiving way to resize.
 fn wire_right_button_resize(
     panel: &Rc<Panel>,
-    root: &gtk::Box,
+    overlay: &gtk::Overlay,
     set_resizing: Rc<dyn Fn(bool)>,
 ) {
     let drag = gtk::GestureDrag::new();
     drag.set_button(gtk::gdk::BUTTON_SECONDARY);
+    // Same widget and same phase as the primary drag, so both read the same
+    // coordinate space.
+    drag.set_propagation_phase(gtk::PropagationPhase::Capture);
 
     {
         let panel = panel.clone();
@@ -605,7 +651,7 @@ fn wire_right_button_resize(
 
     drag.connect_drag_end(move |_, _, _| set_resizing(false));
 
-    root.add_controller(drag);
+    overlay.add_controller(drag);
 }
 
 /// Drain the SIGUSR1 channel on the main thread and toggle the pin there.

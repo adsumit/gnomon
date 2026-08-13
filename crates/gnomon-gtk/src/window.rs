@@ -35,7 +35,6 @@ struct State {
 pub struct Content {
     /// What the window's content is set to.
     pub overlay: gtk::Overlay,
-    pub root: gtk::Box,
     /// Fires on every real allocation. app.rs uses it as the resize
     /// acknowledgement; window.rs uses it for the responsive thresholds.
     pub probe: gtk::DrawingArea,
@@ -136,7 +135,6 @@ pub fn build() -> Content {
 
     Content {
         overlay,
-        root,
         probe,
         set_resizing,
     }
