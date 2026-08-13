@@ -22,18 +22,16 @@ const IN_FLIGHT_TIMEOUT_FRAMES: u32 = 8;
 /// Everything the gestures and the signal handler need to share.
 struct Panel {
     win: adw::ApplicationWindow,
-    grip: gtk::DrawingArea,
     pinned: Cell<bool>,
     margins: Cell<Margins>,
     /// Margins at the moment a drag began.
     drag_origin: Cell<Margins>,
     /// Window size at the moment a resize drag began.
     resize_origin: Cell<(i32, i32)>,
-    /// Set when a left-drag began inside the grip, so the move gesture stands
-    /// down for the whole sequence rather than only at drag-begin.
-    drag_ignored: Cell<bool>,
-    /// Pointer is somewhere over the panel.
-    hovered: Cell<bool>,
+    /// Mode chosen at drag-begin. Never changes mid-drag.
+    drag_zone: Cell<geom::Zone>,
+    /// Surface-local point where the drag began.
+    grab: Cell<(f64, f64)>,
     /// Size the drag currently wants. Updated freely, applied at most once per
     /// frame by the tick callback.
     target: Cell<Option<(i32, i32)>>,
@@ -70,6 +68,61 @@ impl Panel {
             self.win.set_margin(Edge::Top, m.top);
         }
         self.debug_geom(phase, size, size_source);
+    }
+
+    /// The pointer's position in monitor space, from a gesture offset.
+    ///
+    /// COORDINATE SPACE. `grab` is the press point in surface-local
+    /// coordinates, and `(dx, dy)` is the gesture offset in that same space, so
+    /// `grab + offset` is the pointer's current surface-local point. Adding the
+    /// *current* margins — which are the surface's origin, because the layer
+    /// surface is anchored Top and Left — lifts it into monitor space.
+    ///
+    /// This is self-correcting, which is the whole point. If we move the origin
+    /// by d, a stationary pointer's surface-local coordinate shifts by -d and
+    /// the margin we add shifts by +d, so the monitor-space result is
+    /// unchanged. Accumulated deltas have no such property: the widget the
+    /// gesture is attached to is the widget being resized, so its origin slides
+    /// under the pointer and every delta is measured against a moved ruler.
+    fn pointer_in_monitor(&self, dx: f64, dy: f64) -> (i32, i32) {
+        let (gx, gy) = self.grab.get();
+        let m = self.margins.get();
+        (
+            m.left + (gx + dx) as i32,
+            m.top + (gy + dy) as i32,
+        )
+    }
+
+    /// Resize from an absolute pointer position.
+    fn apply_resize(self: &Rc<Self>, zone: geom::Zone, point: (i32, i32), phase: &'static str) {
+        let (margins, size) = geom::resize_from(
+            zone,
+            point,
+            self.drag_origin.get(),
+            self.resize_origin.get(),
+            self.monitor.get(),
+        );
+
+        if margins != self.margins.get() {
+            self.margins.set(margins);
+            self.apply_margins(phase, size, "resize anchor");
+        }
+
+        self.resize_phase.set(phase);
+        self.target.set(Some(size));
+    }
+
+    /// Move so the grabbed point stays under the pointer.
+    fn apply_move(self: &Rc<Self>, point: (i32, i32)) {
+        let (gx, gy) = self.grab.get();
+        let clamped = geom::clamp_margins(
+            point.0 - gx as i32,
+            point.1 - gy as i32,
+            self.panel_size(),
+            self.monitor.get(),
+        );
+        self.margins.set(clamped);
+        self.apply_margins("drag", self.panel_size(), "allocated");
     }
 
     /// Issue at most one size request, called once per frame.
@@ -281,7 +334,6 @@ fn build_window(app: &adw::Application, toplevel: bool) {
 
     let panel = Rc::new(Panel {
         win: win.clone(),
-        grip: content.grip.clone(),
         pinned: Cell::new(false),
         margins: Cell::new(Margins {
             left: geom::EDGE_GAP,
@@ -292,8 +344,8 @@ fn build_window(app: &adw::Application, toplevel: bool) {
             top: geom::EDGE_GAP,
         }),
         resize_origin: Cell::new(DEFAULT_SIZE),
-        drag_ignored: Cell::new(false),
-        hovered: Cell::new(false),
+        drag_zone: Cell::new(geom::Zone::None),
+        grab: Cell::new((0.0, 0.0)),
         target: Cell::new(None),
         in_flight: Cell::new(None),
         in_flight_frames: Cell::new(0),
@@ -322,17 +374,12 @@ fn build_window(app: &adw::Application, toplevel: bool) {
         });
     }
 
-    wire_drag(&panel, &content.root);
+    wire_drag(&panel, &content.root, content.set_resizing.clone());
     if !toplevel {
-        // In toplevel mode the compositor provides resize handles; ours would
-        // only fight it by pinning a minimum size.
-        wire_grip(&panel, content.set_resizing.clone());
-        // Independent of the grip: right-drag resizes whether or not the grip
-        // is currently revealed.
+        // In toplevel mode the compositor owns resizing entirely.
         wire_right_button_resize(&panel, &content.root, content.set_resizing.clone());
+        wire_cursor(&panel, &content.overlay);
     }
-    wire_hover(&panel, &content.overlay);
-    update_grip_visibility(&panel);
     wire_signal(&panel, sig_rx);
 
     {
@@ -426,48 +473,60 @@ fn watch_surface(panel: &Rc<Panel>, win: &adw::ApplicationWindow) {
     });
 }
 
-/// Drag the panel by its body. Inert while pinned.
-fn wire_drag(panel: &Rc<Panel>, root: &gtk::Box) {
+/// One gesture, two modes. The mode is decided at drag-begin from the zone
+/// under the press and never changes for the rest of the sequence.
+fn wire_drag(panel: &Rc<Panel>, root: &gtk::Box, set_resizing: Rc<dyn Fn(bool)>) {
     let drag = gtk::GestureDrag::new();
 
     {
         let panel = panel.clone();
-        let root_for_bounds = root.clone();
-        drag.connect_drag_begin(move |gesture, x, y| {
-            // Belt: refuse a sequence that began on the grip. The grip also
-            // claims it (braces) — either alone can lose to propagation order.
-            if in_grip(&panel.grip, &root_for_bounds, x, y) {
-                panel.drag_ignored.set(true);
-                gesture.set_state(gtk::EventSequenceState::Denied);
+        let set_resizing = set_resizing.clone();
+        drag.connect_drag_begin(move |_, x, y| {
+            if panel.pinned.get() {
+                panel.drag_zone.set(geom::Zone::None);
                 return;
             }
-            panel.drag_ignored.set(false);
+
+            let zone = geom::zone_at(x as i32, y as i32, panel.panel_size());
+            panel.drag_zone.set(zone);
+            panel.grab.set((x, y));
             panel.drag_origin.set(panel.margins.get());
+            panel.resize_origin.set(panel.panel_size());
+
+            if zone.is_resize() {
+                set_resizing(true);
+            }
         });
     }
 
     {
         let panel = panel.clone();
         drag.connect_drag_update(move |_, dx, dy| {
-            if panel.drag_ignored.get() || panel.pinned.get() || !panel.layered {
+            if panel.pinned.get() || !panel.layered {
                 return;
             }
-            let origin = panel.drag_origin.get();
-            let clamped = geom::clamp_margins(
-                origin.left + dx as i32,
-                origin.top + dy as i32,
-                panel.panel_size(),
-                panel.monitor.get(),
-            );
-            panel.margins.set(clamped);
-            panel.apply_margins("drag", panel.panel_size(), "allocated");
+            let point = panel.pointer_in_monitor(dx, dy);
+            let zone = panel.drag_zone.get();
+
+            if zone.is_resize() {
+                panel.apply_resize(zone, point, "resize-edge");
+            } else {
+                panel.apply_move(point);
+            }
         });
     }
 
     {
         let panel = panel.clone();
         drag.connect_drag_end(move |_, _, _| {
-            if panel.drag_ignored.get() || panel.pinned.get() || !panel.layered {
+            let zone = panel.drag_zone.get();
+            panel.drag_zone.set(geom::Zone::None);
+
+            if zone.is_resize() {
+                set_resizing(false);
+                return;
+            }
+            if panel.pinned.get() || !panel.layered {
                 return;
             }
             let m = panel.margins.get();
@@ -480,93 +539,36 @@ fn wire_drag(panel: &Rc<Panel>, root: &gtk::Box) {
     root.add_controller(drag);
 }
 
-/// Reveal the grip on hover, hide it on leave.
-fn wire_hover(panel: &Rc<Panel>, overlay: &gtk::Overlay) {
+/// Track the pointer and show the matching resize cursor.
+fn wire_cursor(panel: &Rc<Panel>, overlay: &gtk::Overlay) {
     let motion = gtk::EventControllerMotion::new();
 
     {
         let panel = panel.clone();
-        motion.connect_enter(move |_, _, _| {
-            panel.hovered.set(true);
-            update_grip_visibility(&panel);
+        motion.connect_motion(move |_, x, y| {
+            if panel.pinned.get() {
+                panel.win.set_cursor(None);
+                return;
+            }
+            let zone = geom::zone_at(x as i32, y as i32, panel.panel_size());
+            match zone.cursor_name() {
+                Some(name) => panel.win.set_cursor_from_name(Some(name)),
+                None => panel.win.set_cursor(None),
+            }
         });
     }
 
     {
         let panel = panel.clone();
-        motion.connect_leave(move |_| {
-            panel.hovered.set(false);
-            update_grip_visibility(&panel);
-        });
+        motion.connect_leave(move |_| panel.win.set_cursor(None));
     }
 
     overlay.add_controller(motion);
 }
 
-/// The single place that decides whether the grip is on screen.
+/// Right-button drag resizes from the bottom-right, wherever it starts.
 ///
-/// The two hard conditions are evaluated FIRST and combined into `interactive`;
-/// hover is only ANDed on afterwards. Hover can therefore never resurrect the
-/// grip while pinned or in toplevel mode — it can only reveal a grip that is
-/// already permitted. Every path that changes any of the three inputs calls
-/// this, so there is no second place for the rule to drift.
-fn update_grip_visibility(panel: &Rc<Panel>) {
-    let interactive = panel.layered && !panel.pinned.get();
-    panel.grip.set_visible(interactive && panel.hovered.get());
-}
-
-/// Is this point, in `origin`'s coordinate space, inside the grip?
-///
-/// `compute_bounds` translates between the two widgets explicitly, so this does
-/// not assume the grip and the root share an origin.
-fn in_grip(grip: &gtk::DrawingArea, origin: &gtk::Box, x: f64, y: f64) -> bool {
-    if !grip.is_visible() {
-        return false;
-    }
-
-    match grip.compute_bounds(origin) {
-        Some(r) => {
-            x >= r.x() as f64
-                && x <= (r.x() + r.width()) as f64
-                && y >= r.y() as f64
-                && y <= (r.y() + r.height()) as f64
-        }
-        None => false,
-    }
-}
-
-/// Resize from the bottom-right grip. Inert while pinned.
-fn wire_grip(panel: &Rc<Panel>, set_resizing: Rc<dyn Fn(bool)>) {
-    let drag = gtk::GestureDrag::new();
-
-    {
-        let panel = panel.clone();
-        let set_resizing = set_resizing.clone();
-        drag.connect_drag_begin(move |gesture, _, _| {
-            // Braces: take the sequence so the root's move gesture cannot also
-            // act on it.
-            gesture.set_state(gtk::EventSequenceState::Claimed);
-            panel.resize_origin.set(panel.panel_size());
-            set_resizing(true);
-        });
-    }
-
-    {
-        let panel = panel.clone();
-        drag.connect_drag_update(move |_, dx, dy| {
-            resize_by(&panel, dx, dy, "resize-grip");
-        });
-    }
-
-    drag.connect_drag_end(move |_, _, _| set_resizing(false));
-
-    panel.grip.add_controller(drag);
-}
-
-/// Right-button drag anywhere on the panel resizes it.
-///
-/// This is the primary gesture; the corner grip is the discoverable affordance
-/// for it.
+/// The edge zones are only 8px, so this stays the forgiving way to resize.
 fn wire_right_button_resize(
     panel: &Rc<Panel>,
     root: &gtk::Box,
@@ -578,8 +580,10 @@ fn wire_right_button_resize(
     {
         let panel = panel.clone();
         let set_resizing = set_resizing.clone();
-        drag.connect_drag_begin(move |gesture, _, _| {
+        drag.connect_drag_begin(move |gesture, x, y| {
             gesture.set_state(gtk::EventSequenceState::Claimed);
+            panel.grab.set((x, y));
+            panel.drag_origin.set(panel.margins.get());
             panel.resize_origin.set(panel.panel_size());
             set_resizing(true);
         });
@@ -588,33 +592,17 @@ fn wire_right_button_resize(
     {
         let panel = panel.clone();
         drag.connect_drag_update(move |_, dx, dy| {
-            resize_by(&panel, dx, dy, "resize-rmb");
+            if panel.pinned.get() || !panel.layered {
+                return;
+            }
+            let point = panel.pointer_in_monitor(dx, dy);
+            panel.apply_resize(geom::Zone::BottomRight, point, "resize-rmb");
         });
     }
 
     drag.connect_drag_end(move |_, _, _| set_resizing(false));
 
     root.add_controller(drag);
-}
-
-/// Shared resize maths. Layer-mode only; the compositor owns a toplevel's size.
-///
-/// A layer surface negotiates from the window's *default* size, so
-/// `set_default_size` is the lever. `set_size_request` only sets a minimum,
-/// which is why it produced a hard 300x150 floor.
-///
-/// A drag-update only records the desired size. The frame clock decides when
-/// to ask for it, and the flow control decides whether to ask at all.
-fn resize_by(panel: &Rc<Panel>, dx: f64, dy: f64, phase: &'static str) {
-    if panel.pinned.get() || !panel.layered {
-        return;
-    }
-
-    let (w0, h0) = panel.resize_origin.get();
-    let size = geom::clamp_size(w0 + dx as i32, h0 + dy as i32, panel.monitor.get());
-
-    panel.resize_phase.set(phase);
-    panel.target.set(Some(size));
 }
 
 /// Drain the SIGUSR1 channel on the main thread and toggle the pin there.
@@ -636,7 +624,10 @@ fn set_pinned(panel: &Rc<Panel>, pinned: bool) {
         panel.win.remove_css_class("pinned");
     }
 
-    update_grip_visibility(panel);
+    if pinned {
+        // No resize cursors on a click-through panel.
+        panel.win.set_cursor(None);
+    }
     pin::apply_input_region(&panel.win, pinned);
 
     eprintln!(

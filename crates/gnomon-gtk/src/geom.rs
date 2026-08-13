@@ -8,7 +8,7 @@ pub const SNAP_THRESHOLD: i32 = 48;
 /// The gap a snapped edge settles at.
 pub const EDGE_GAP: i32 = 12;
 
-/// Smallest panel the resize grip will produce.
+/// Smallest panel an edge drag will produce.
 pub const MIN_WIDTH: i32 = 200;
 pub const MIN_HEIGHT: i32 = 100;
 
@@ -128,12 +128,140 @@ pub fn responsive_state(
     (compact, tight)
 }
 
-/// Clamp a grip-driven size to the allowed range.
-pub fn clamp_size(width: i32, height: i32, monitor: (i32, i32)) -> (i32, i32) {
-    (
-        width.clamp(MIN_WIDTH, monitor.0.max(MIN_WIDTH)),
-        height.clamp(MIN_HEIGHT, monitor.1.max(MIN_HEIGHT)),
-    )
+/// Thickness of the interactive edge and corner resize band.
+pub const RESIZE_EDGE: i32 = 8;
+
+/// Which part of the panel a point falls in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Zone {
+    None,
+    Top,
+    Bottom,
+    Left,
+    Right,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl Zone {
+    /// The CSS cursor name for this zone, or `None` for the default cursor.
+    pub fn cursor_name(self) -> Option<&'static str> {
+        match self {
+            Zone::None => None,
+            Zone::Top => Some("n-resize"),
+            Zone::Bottom => Some("s-resize"),
+            Zone::Left => Some("w-resize"),
+            Zone::Right => Some("e-resize"),
+            Zone::TopLeft => Some("nw-resize"),
+            Zone::TopRight => Some("ne-resize"),
+            Zone::BottomLeft => Some("sw-resize"),
+            Zone::BottomRight => Some("se-resize"),
+        }
+    }
+
+    pub fn is_resize(self) -> bool {
+        self != Zone::None
+    }
+}
+
+/// Classify a surface-local point. Corners win over edges.
+pub fn zone_at(x: i32, y: i32, size: (i32, i32)) -> Zone {
+    let (w, h) = size;
+
+    // Outside the surface is not a resize zone.
+    if x < 0 || y < 0 || x >= w || y >= h {
+        return Zone::None;
+    }
+
+    let left = x < RESIZE_EDGE;
+    let right = x >= w - RESIZE_EDGE;
+    let top = y < RESIZE_EDGE;
+    let bottom = y >= h - RESIZE_EDGE;
+
+    // Corners first, so a corner never degrades to a single edge.
+    if top && left {
+        return Zone::TopLeft;
+    }
+    if top && right {
+        return Zone::TopRight;
+    }
+    if bottom && left {
+        return Zone::BottomLeft;
+    }
+    if bottom && right {
+        return Zone::BottomRight;
+    }
+
+    if top {
+        Zone::Top
+    } else if bottom {
+        Zone::Bottom
+    } else if left {
+        Zone::Left
+    } else if right {
+        Zone::Right
+    } else {
+        Zone::None
+    }
+}
+
+/// New margins and size for a resize drag.
+///
+/// `point` is the pointer in monitor space. `margins` and `size` are the values
+/// captured at drag-begin, so every frame is computed from the pointer's
+/// absolute position rather than from accumulated deltas.
+///
+/// A Left or Top drag pins the opposite edge: the size grows and the margin
+/// shrinks by the same amount. Crucially the margin is derived from the
+/// *clamped* size, so when the minimum is reached the panel stops moving too
+/// rather than sliding while refusing to shrink.
+pub fn resize_from(
+    zone: Zone,
+    point: (i32, i32),
+    margins: Margins,
+    size: (i32, i32),
+    monitor: (i32, i32),
+) -> (Margins, (i32, i32)) {
+    let (w0, h0) = size;
+    let right_edge = margins.left + w0;
+    let bottom_edge = margins.top + h0;
+
+    let mut left = margins.left;
+    let mut top = margins.top;
+    let mut width = w0;
+    let mut height = h0;
+
+    match zone {
+        Zone::Right | Zone::TopRight | Zone::BottomRight => {
+            // Left edge pinned: grow right, up to the monitor's right edge.
+            let available = (monitor.0 - margins.left).max(MIN_WIDTH);
+            width = (point.0 - margins.left).clamp(MIN_WIDTH, available);
+        }
+        Zone::Left | Zone::TopLeft | Zone::BottomLeft => {
+            // Right edge pinned: grow left, up to the monitor's left edge.
+            let available = right_edge.max(MIN_WIDTH);
+            width = (right_edge - point.0).clamp(MIN_WIDTH, available);
+            left = right_edge - width;
+        }
+        _ => {}
+    }
+
+    match zone {
+        Zone::Bottom | Zone::BottomLeft | Zone::BottomRight => {
+            let available = (monitor.1 - margins.top).max(MIN_HEIGHT);
+            height = (point.1 - margins.top).clamp(MIN_HEIGHT, available);
+        }
+        Zone::Top | Zone::TopLeft | Zone::TopRight => {
+            let available = bottom_edge.max(MIN_HEIGHT);
+            height = (bottom_edge - point.1).clamp(MIN_HEIGHT, available);
+            top = bottom_edge - height;
+        }
+        _ => {}
+    }
+
+    (Margins { left, top }, (width, height))
 }
 
 #[cfg(test)]
@@ -349,10 +477,187 @@ mod tests {
         assert_eq!(responsive_state(300, 0, false, false), (false, false));
     }
 
+    // ---- zone classification ----
+
+    const SIZE: (i32, i32) = (300, 150);
+
     #[test]
-    fn clamp_size_respects_bounds() {
-        assert_eq!(clamp_size(10, 10, MONITOR), (MIN_WIDTH, MIN_HEIGHT));
-        assert_eq!(clamp_size(9999, 9999, MONITOR), MONITOR);
-        assert_eq!(clamp_size(400, 300, MONITOR), (400, 300));
+    fn zone_interior_is_none() {
+        assert_eq!(zone_at(150, 75, SIZE), Zone::None);
     }
+
+    #[test]
+    fn zone_each_edge() {
+        assert_eq!(zone_at(150, 2, SIZE), Zone::Top);
+        assert_eq!(zone_at(150, 147, SIZE), Zone::Bottom);
+        assert_eq!(zone_at(2, 75, SIZE), Zone::Left);
+        assert_eq!(zone_at(297, 75, SIZE), Zone::Right);
+    }
+
+    #[test]
+    fn zone_each_corner_beats_the_edges() {
+        assert_eq!(zone_at(2, 2, SIZE), Zone::TopLeft);
+        assert_eq!(zone_at(297, 2, SIZE), Zone::TopRight);
+        assert_eq!(zone_at(2, 147, SIZE), Zone::BottomLeft);
+        assert_eq!(zone_at(297, 147, SIZE), Zone::BottomRight);
+    }
+
+    #[test]
+    fn zone_boundary_pixels_on_the_left() {
+        // RESIZE_EDGE is 8, so 0..=7 are the band and 8 is interior.
+        assert_eq!(zone_at(0, 75, SIZE), Zone::Left);
+        assert_eq!(zone_at(7, 75, SIZE), Zone::Left);
+        assert_eq!(zone_at(8, 75, SIZE), Zone::None);
+    }
+
+    #[test]
+    fn zone_boundary_pixels_on_the_right() {
+        // w - RESIZE_EDGE == 292 is the first pixel of the band.
+        assert_eq!(zone_at(291, 75, SIZE), Zone::None);
+        assert_eq!(zone_at(292, 75, SIZE), Zone::Right);
+        assert_eq!(zone_at(299, 75, SIZE), Zone::Right);
+    }
+
+    #[test]
+    fn zone_boundary_pixels_vertically() {
+        assert_eq!(zone_at(150, 0, SIZE), Zone::Top);
+        assert_eq!(zone_at(150, 7, SIZE), Zone::Top);
+        assert_eq!(zone_at(150, 8, SIZE), Zone::None);
+        assert_eq!(zone_at(150, 141, SIZE), Zone::None);
+        assert_eq!(zone_at(150, 142, SIZE), Zone::Bottom);
+        assert_eq!(zone_at(150, 149, SIZE), Zone::Bottom);
+    }
+
+    #[test]
+    fn zone_outside_the_surface_is_none() {
+        assert_eq!(zone_at(-1, 75, SIZE), Zone::None);
+        assert_eq!(zone_at(300, 75, SIZE), Zone::None);
+        assert_eq!(zone_at(150, -1, SIZE), Zone::None);
+        assert_eq!(zone_at(150, 150, SIZE), Zone::None);
+    }
+
+    #[test]
+    fn zone_cursor_names_are_the_css_ones() {
+        assert_eq!(Zone::None.cursor_name(), None);
+        assert_eq!(Zone::Top.cursor_name(), Some("n-resize"));
+        assert_eq!(Zone::Bottom.cursor_name(), Some("s-resize"));
+        assert_eq!(Zone::Left.cursor_name(), Some("w-resize"));
+        assert_eq!(Zone::Right.cursor_name(), Some("e-resize"));
+        assert_eq!(Zone::TopLeft.cursor_name(), Some("nw-resize"));
+        assert_eq!(Zone::TopRight.cursor_name(), Some("ne-resize"));
+        assert_eq!(Zone::BottomLeft.cursor_name(), Some("sw-resize"));
+        assert_eq!(Zone::BottomRight.cursor_name(), Some("se-resize"));
+    }
+
+    // ---- resize maths ----
+
+    const M0: Margins = Margins { left: 500, top: 300 };
+    const S0: (i32, i32) = (300, 150);
+
+    #[test]
+    fn resize_right_edge_changes_size_only() {
+        // Pointer at x=900: width becomes 900 - 500 = 400.
+        let (m, s) = resize_from(Zone::Right, (900, 400), M0, S0, MONITOR);
+        assert_eq!(m, M0, "the anchored corner must not move");
+        assert_eq!(s, (400, 150));
+    }
+
+    #[test]
+    fn resize_bottom_edge_changes_size_only() {
+        let (m, s) = resize_from(Zone::Bottom, (600, 700), M0, S0, MONITOR);
+        assert_eq!(m, M0);
+        assert_eq!(s, (300, 400));
+    }
+
+    #[test]
+    fn resize_left_edge_moves_the_margin_with_the_size() {
+        // Right edge is pinned at 500 + 300 = 800. Pointer at x=400:
+        // width becomes 400, and the margin must follow to 800 - 400.
+        let (m, s) = resize_from(Zone::Left, (400, 400), M0, S0, MONITOR);
+        assert_eq!(s, (400, 150));
+        assert_eq!(m.left, 400);
+        assert_eq!(m.left + s.0, 800, "the right edge stays put");
+        assert_eq!(m.top, M0.top);
+    }
+
+    #[test]
+    fn resize_top_edge_moves_the_margin_with_the_size() {
+        // Bottom edge pinned at 300 + 150 = 450. Pointer at y=200:
+        // height becomes 250.
+        let (m, s) = resize_from(Zone::Top, (600, 200), M0, S0, MONITOR);
+        assert_eq!(s, (300, 250));
+        assert_eq!(m.top, 200);
+        assert_eq!(m.top + s.1, 450, "the bottom edge stays put");
+        assert_eq!(m.left, M0.left);
+    }
+
+    #[test]
+    fn resize_bottom_right_corner_moves_both_axes() {
+        let (m, s) = resize_from(Zone::BottomRight, (900, 700), M0, S0, MONITOR);
+        assert_eq!(m, M0, "both anchored edges stay put");
+        assert_eq!(s, (400, 400));
+    }
+
+    #[test]
+    fn resize_top_left_corner_moves_both_margins() {
+        let (m, s) = resize_from(Zone::TopLeft, (400, 200), M0, S0, MONITOR);
+        assert_eq!(s, (400, 250));
+        assert_eq!(m, Margins { left: 400, top: 200 });
+        assert_eq!(m.left + s.0, 800);
+        assert_eq!(m.top + s.1, 450);
+    }
+
+    #[test]
+    fn resize_top_right_corner() {
+        let (m, s) = resize_from(Zone::TopRight, (900, 200), M0, S0, MONITOR);
+        assert_eq!(s, (400, 250));
+        assert_eq!(m.left, M0.left, "left edge pinned");
+        assert_eq!(m.top, 200);
+    }
+
+    #[test]
+    fn resize_bottom_left_corner() {
+        let (m, s) = resize_from(Zone::BottomLeft, (400, 700), M0, S0, MONITOR);
+        assert_eq!(s, (400, 400));
+        assert_eq!(m.left, 400);
+        assert_eq!(m.top, M0.top, "top edge pinned");
+    }
+
+    #[test]
+    fn resize_left_edge_stops_moving_at_the_minimum_width() {
+        // Dragging the left edge far past the minimum. Width must clamp to
+        // MIN_WIDTH and the margin must stop with it: if the margin kept
+        // tracking the pointer the panel would slide while refusing to shrink.
+        let (m, s) = resize_from(Zone::Left, (790, 400), M0, S0, MONITOR);
+        assert_eq!(s.0, MIN_WIDTH);
+        assert_eq!(
+            m.left,
+            800 - MIN_WIDTH,
+            "the margin is derived from the clamped size, not the pointer"
+        );
+        assert_eq!(m.left + s.0, 800, "the right edge is still pinned");
+    }
+
+    #[test]
+    fn resize_top_edge_stops_moving_at_the_minimum_height() {
+        let (m, s) = resize_from(Zone::Top, (600, 445), M0, S0, MONITOR);
+        assert_eq!(s.1, MIN_HEIGHT);
+        assert_eq!(m.top, 450 - MIN_HEIGHT);
+        assert_eq!(m.top + s.1, 450);
+    }
+
+    #[test]
+    fn resize_right_edge_stops_at_the_monitor_edge() {
+        let (m, s) = resize_from(Zone::Right, (9999, 400), M0, S0, MONITOR);
+        assert_eq!(m, M0);
+        assert_eq!(s.0, MONITOR.0 - M0.left, "cannot extend past the screen");
+    }
+
+    #[test]
+    fn resize_none_zone_changes_nothing() {
+        let (m, s) = resize_from(Zone::None, (900, 700), M0, S0, MONITOR);
+        assert_eq!(m, M0);
+        assert_eq!(s, S0);
+    }
+
 }

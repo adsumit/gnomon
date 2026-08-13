@@ -16,8 +16,6 @@ const SEVERITY_CLASSES: [&str; 3] = ["sev-normal", "sev-warning", "sev-error"];
 /// Root box spacing, normal and tightened.
 const SPACING: i32 = 14;
 const SPACING_TIGHT: i32 = 6;
-/// Edge length of the resize grip.
-const GRIP_SIZE: i32 = 14;
 
 /// One rendered limit window, kept so the countdown can tick without a rebuild.
 struct Row {
@@ -38,7 +36,6 @@ pub struct Content {
     /// What the window's content is set to.
     pub overlay: gtk::Overlay,
     pub root: gtk::Box,
-    pub grip: gtk::DrawingArea,
     /// Fires on every real allocation. app.rs uses it as the resize
     /// acknowledgement; window.rs uses it for the responsive thresholds.
     pub probe: gtk::DrawingArea,
@@ -51,14 +48,14 @@ pub struct Content {
 pub fn build() -> Content {
     // No widget margins: #root's 16px CSS padding provides the inset *inside*
     // the painted background. Margins would push the background away from the
-    // surface edge and strand the overlay-aligned grip outside it.
+    // surface edge, leaving a dead transparent band around the panel.
     let root = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(SPACING)
         .build();
     root.set_widget_name("root");
-    // Natural content width must not be a floor, or the resize grip cannot
-    // shrink the panel below whatever the labels happen to need.
+    // Natural content width must not be a floor, or an edge drag cannot shrink
+    // the panel below whatever the labels happen to need.
     root.set_size_request(0, -1);
 
     let status = gtk::Label::builder()
@@ -68,23 +65,6 @@ pub fn build() -> Content {
         .ellipsize(pango::EllipsizeMode::End)
         .build();
     status.add_css_class("dim-label");
-
-    // Pinned to the panel's bottom-right corner by the overlay, so no box
-    // layout decision can move it.
-    let grip = gtk::DrawingArea::builder()
-        .content_width(GRIP_SIZE)
-        .content_height(GRIP_SIZE)
-        .width_request(GRIP_SIZE)
-        .height_request(GRIP_SIZE)
-        .halign(gtk::Align::End)
-        .valign(gtk::Align::End)
-        .margin_end(8)
-        .margin_bottom(8)
-        // Revealed on hover, and only when the panel is interactive.
-        .visible(false)
-        .build();
-    grip.set_widget_name("grip");
-    draw_grip(&grip);
 
     let state = Rc::new(RefCell::new(State {
         windows: Vec::new(),
@@ -114,9 +94,6 @@ pub fn build() -> Content {
     render(&root, &status, &state);
     debug_css_on_realize(&root);
     let (probe, set_resizing) = watch_width(&overlay, &root, &status, &state);
-
-    // Added last so the grip sits above the probe.
-    overlay.add_overlay(&grip);
 
     let (tx, rx) = async_channel::unbounded::<Update>();
     feed::spawn(tx);
@@ -160,7 +137,6 @@ pub fn build() -> Content {
     Content {
         overlay,
         root,
-        grip,
         probe,
         set_resizing,
     }
@@ -276,34 +252,6 @@ fn block_scrolling(scrolled: &gtk::ScrolledWindow) {
     scrolled.add_controller(scroll);
 }
 
-/// Three dots stepping up the diagonal, in the theme's foreground colour.
-///
-/// The 0.35 opacity comes from `#grip` in the stylesheet, so this just uses the
-/// resolved foreground directly.
-fn draw_grip(grip: &gtk::DrawingArea) {
-    grip.set_draw_func(|area, cr, width, height| {
-        let c = area.color();
-        cr.set_source_rgba(
-            c.red() as f64,
-            c.green() as f64,
-            c.blue() as f64,
-            c.alpha() as f64,
-        );
-
-        for i in 0..3 {
-            let offset = 3.5 + (i as f64) * 4.0;
-            cr.arc(
-                width as f64 - offset,
-                height as f64 - offset,
-                1.2,
-                0.0,
-                std::f64::consts::TAU,
-            );
-            let _ = cr.fill();
-        }
-    });
-}
-
 /// Named colours the panel depends on.
 const PROBED_COLORS: [&str; 5] = [
     "window_bg_color",
@@ -371,8 +319,8 @@ fn apply(state: &Rc<RefCell<State>>, snapshot: UsageSnapshot) -> bool {
 
 /// Rebuild the children of `root` from the stored state.
 fn render(root: &gtk::Box, status: &gtk::Label, state: &Rc<RefCell<State>>) {
-    // The probe and the grip live in the overlay, so rebuilding the box's
-    // children cannot destroy them.
+    // The probe lives in the overlay, so rebuilding the box's children cannot
+    // destroy it.
     while let Some(child) = root.first_child() {
         root.remove(&child);
     }
