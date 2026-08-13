@@ -68,8 +68,16 @@ Render one bar per entry in `limits[]`. Never hardcode a bar count.
 - The exclusive zone is always 0. gnomon never reserves space or shifts other windows.
 - Pinned means click-through and non-interactive: the surface carries an empty input
   region, so every click reaches whatever is beneath it.
+- Panels are independent layer surfaces. Each owns its own position, size and pin state;
+  none of the three is shared.
+- Dragging a row more than 40px tears it into a panel of its own. The drag continues,
+  driving the new panel.
+- On release, a panel within 60px of another merges into it. The stationary panel absorbs
+  the kinds and keeps its own position, size and pin state.
 - The pin toggle is delivered by SIGUSR1, because a click-through surface cannot be
-  clicked to un-pin itself.
+  clicked to un-pin itself. SIGUSR1 applies to ALL panels at once: if any is pinned it
+  unpins every panel, otherwise it pins every panel. A click-through panel is therefore
+  always recoverable.
 
 ## Security rules
 

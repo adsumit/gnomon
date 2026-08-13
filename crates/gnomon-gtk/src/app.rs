@@ -1,17 +1,21 @@
-//! Application setup: styling, layer-shell placement, and interaction.
+//! Application setup, and the panels themselves.
+//!
+//! A `Panel` is one layer surface with its own position, size and pin state.
+//! `Layout` owns them all and is the only thing that knows how many exist.
 
-use std::cell::Cell;
-use std::rc::Rc;
+use std::cell::{Cell, RefCell};
+use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
 use gtk::{gdk, glib};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
-use crate::geom::{self, Margins};
+use crate::feed::{self, Update};
+use crate::geom::{self, Margins, Zone};
 use crate::{pin, window};
 
 const APP_ID: &str = "com.gnomon.Gnomon";
-/// Initial window size, and the size used to place the panel before the first
+/// Initial window size, and the size used to place the first panel before any
 /// allocation makes a real measurement available.
 const DEFAULT_SIZE: (i32, i32) = (300, 150);
 const STYLE: &str = include_str!("style.css");
@@ -19,9 +23,20 @@ const STYLE: &str = include_str!("style.css");
 /// Without this, one unacknowledged request would freeze resizing for good.
 const IN_FLIGHT_TIMEOUT_FRAMES: u32 = 8;
 
-/// Everything the gestures and the signal handler need to share.
-struct Panel {
+/// One panel: one layer surface, one set of kinds, its own everything.
+pub struct Panel {
     win: adw::ApplicationWindow,
+    content: window::Content,
+    layout: Weak<Layout>,
+    layered: bool,
+
+    monitor: Cell<(i32, i32)>,
+    /// Only the first panel derives its position from the monitor; torn-off
+    /// panels are placed explicitly by the tear.
+    auto_place: Cell<bool>,
+    default_size: (i32, i32),
+
+    // ---- per-window interaction state ----
     pinned: Cell<bool>,
     margins: Cell<Margins>,
     /// Margins at the moment a drag began.
@@ -29,43 +44,205 @@ struct Panel {
     /// Window size at the moment a resize drag began.
     resize_origin: Cell<(i32, i32)>,
     /// Mode chosen at drag-begin. Never changes mid-drag.
-    drag_zone: Cell<geom::Zone>,
+    drag_zone: Cell<Zone>,
     /// Surface-local point where the drag began.
     grab: Cell<(f64, f64)>,
+    /// The row the drag began on, and where its top was, so a tear can place
+    /// the new panel under the same part of the pointer.
+    drag_row: RefCell<Option<String>>,
+    drag_row_top: Cell<f64>,
+    /// Once a tear has happened, the rest of this gesture drives that panel.
+    drag_target: RefCell<Option<Rc<Panel>>>,
+
     /// Last point and zone the motion controller saw, purely for the
     /// drag-begin trace: printing both on one line is what exposes a
     /// coordinate-space disagreement between the two paths.
     last_motion: Cell<(f64, f64)>,
-    last_motion_zone: Cell<geom::Zone>,
-    /// Size the drag currently wants. Updated freely, applied at most once per
-    /// frame by the tick callback.
+    last_motion_zone: Cell<Zone>,
+
+    // ---- resize flow control ----
     target: Cell<Option<(i32, i32)>>,
-    /// A request handed to the compositor that has not yet come back as an
-    /// allocation. While set, no new request is issued.
     in_flight: Cell<Option<(i32, i32)>>,
-    /// Frames elapsed since `in_flight` was set, for the stuck-state timeout.
     in_flight_frames: Cell<u32>,
-    /// Most recent request, for comparing against an arriving allocation.
     last_requested: Cell<Option<(i32, i32)>>,
-    /// Most recent size the probe actually reported.
     last_allocated: Cell<Option<(i32, i32)>>,
-    /// Phase label for the trace.
     resize_phase: Cell<&'static str>,
-    monitor: Cell<(i32, i32)>,
-    /// The size the window was configured with, valid before allocation.
-    default_size: (i32, i32),
-    layered: bool,
 }
 
 impl Panel {
+    /// Create a panel rendering `kinds`, at `margins`, sized `size`.
+    ///
+    /// An empty `kinds` means "render everything", which is the state the
+    /// single startup panel is in.
+    pub fn new(
+        layout: &Rc<Layout>,
+        kinds: Vec<String>,
+        margins: Margins,
+        size: (i32, i32),
+    ) -> Rc<Panel> {
+        let toplevel = layout.toplevel;
+
+        let win = adw::ApplicationWindow::builder()
+            .application(&layout.app)
+            .default_width(size.0)
+            .default_height(size.1)
+            .resizable(true)
+            .title("gnomon")
+            .build();
+
+        // A layer surface negotiates from the default size; the size request
+        // must never become a floor under it.
+        win.set_size_request(1, 1);
+
+        if !toplevel {
+            // Scopes the transparency rule, so --toplevel keeps a solid window.
+            win.add_css_class("gnomon-layer");
+
+            // All of this must happen before the window is realized.
+            win.init_layer_shell();
+            win.set_layer(Layer::Overlay);
+            // Anchored Top+Left so the margins are an absolute position.
+            win.set_anchor(Edge::Top, true);
+            win.set_anchor(Edge::Left, true);
+            win.set_anchor(Edge::Right, false);
+            win.set_anchor(Edge::Bottom, false);
+            win.set_margin(Edge::Top, margins.top);
+            win.set_margin(Edge::Left, margins.left);
+            // Never take focus, in either pin state. Never reserve space.
+            win.set_keyboard_mode(KeyboardMode::None);
+            win.set_exclusive_zone(0);
+        }
+
+        let content = window::build(kinds);
+        win.set_content(Some(&content.overlay));
+
+        let panel = Rc::new(Panel {
+            win: win.clone(),
+            content,
+            layout: Rc::downgrade(layout),
+            layered: !toplevel,
+            monitor: Cell::new((0, 0)),
+            auto_place: Cell::new(false),
+            default_size: size,
+            pinned: Cell::new(false),
+            margins: Cell::new(margins),
+            drag_origin: Cell::new(margins),
+            resize_origin: Cell::new(size),
+            drag_zone: Cell::new(Zone::None),
+            grab: Cell::new((0.0, 0.0)),
+            drag_row: RefCell::new(None),
+            drag_row_top: Cell::new(0.0),
+            drag_target: RefCell::new(None),
+            last_motion: Cell::new((-1.0, -1.0)),
+            last_motion_zone: Cell::new(Zone::None),
+            target: Cell::new(None),
+            in_flight: Cell::new(None),
+            in_flight_frames: Cell::new(0),
+            last_requested: Cell::new(None),
+            last_allocated: Cell::new(None),
+            resize_phase: Cell::new("resize"),
+        });
+
+        // One request per frame, decided by the flow control in tick_resize.
+        {
+            let panel = panel.clone();
+            win.add_tick_callback(move |_, _| {
+                panel.tick_resize();
+                glib::ControlFlow::Continue
+            });
+        }
+
+        // The probe's resize signal is the real "the surface changed size" event.
+        {
+            let panel_for_probe = panel.clone();
+            panel.content.probe.connect_resize(move |_, w, h| {
+                panel_for_probe.on_allocation(w, h);
+            });
+        }
+
+        // Every pointer path is attached to the overlay so they share one
+        // coordinate space, and all of them measure against the window's size.
+        wire_drag(&panel);
+        wire_middle_click(&panel);
+        if !toplevel {
+            wire_right_button_resize(&panel);
+            wire_cursor(&panel);
+        }
+
+        {
+            let panel = panel.clone();
+            win.connect_realize(move |win| {
+                panel.on_realize(win);
+            });
+        }
+
+        win.present();
+        panel
+    }
+
+    pub fn rect(&self) -> geom::Rect {
+        geom::Rect::new(self.margins.get(), self.panel_size())
+    }
+
     fn panel_size(&self) -> (i32, i32) {
         (self.win.width().max(1), self.win.height().max(1))
     }
 
-    /// Push the stored margins onto the layer surface.
+    fn close(&self) {
+        self.win.close();
+    }
+
+    /// Monitor geometry, and — for the first panel only — its position.
+    fn on_realize(self: &Rc<Self>, win: &adw::ApplicationWindow) {
+        let monitor = monitor_size(win);
+        self.monitor.set(monitor);
+
+        if self.layered && self.auto_place.get() {
+            // Deliberately NOT panel_size(): at realize the window has not been
+            // allocated, so its width reads 0 and the panel lands off-screen.
+            let size = self.default_size;
+
+            let (margins, source) = if monitor.0 > 0 && monitor.1 > 0 {
+                (
+                    geom::initial_margins(size, monitor),
+                    "configured default size",
+                )
+            } else {
+                // Monitor unknown: do not compute an offset at all.
+                (
+                    Margins {
+                        left: geom::EDGE_GAP,
+                        top: geom::EDGE_GAP,
+                    },
+                    "monitor unknown, no offset computed",
+                )
+            };
+
+            self.margins.set(margins);
+            self.apply_margins("realize", size, source);
+        }
+
+        self.watch_surface(win);
+    }
+
+    /// Re-apply the input region whenever the surface is laid out again.
     ///
-    /// `size` and `size_source` exist for the diagnostics: knowing *which*
-    /// number fed the calculation is the whole point of the probe.
+    /// A move or a resize produces a new configuration and drops the region, so
+    /// applying it once at startup is not enough.
+    fn watch_surface(self: &Rc<Self>, win: &adw::ApplicationWindow) {
+        pin::apply_input_region(win, self.pinned.get());
+
+        let Some(surface) = win.surface() else {
+            return;
+        };
+
+        let panel = self.clone();
+        surface.connect_layout(move |_, _, _| {
+            pin::apply_input_region(&panel.win, panel.pinned.get());
+        });
+    }
+
+    /// Push the stored margins onto the layer surface.
     fn apply_margins(&self, phase: &str, size: (i32, i32), size_source: &str) {
         if self.layered {
             let m = self.margins.get();
@@ -100,9 +277,7 @@ impl Panel {
     }
 
     /// Resize from an absolute pointer position.
-    ///
-    /// Anchored on the drag-begin margins and size, for the same reason.
-    fn apply_resize(self: &Rc<Self>, zone: geom::Zone, point: (i32, i32), phase: &'static str) {
+    fn apply_resize(self: &Rc<Self>, zone: Zone, point: (i32, i32), phase: &'static str) {
         let (margins, size) = geom::resize_from(
             zone,
             point,
@@ -134,9 +309,6 @@ impl Panel {
     }
 
     /// Issue at most one size request, called once per frame.
-    ///
-    /// Returns without acting unless there is a target, nothing is in flight,
-    /// and the target actually differs from what is already on screen.
     fn tick_resize(self: &Rc<Self>) {
         if self.pinned.get() || !self.layered {
             return;
@@ -176,11 +348,6 @@ impl Panel {
     }
 
     /// An allocation arrived: the surface has genuinely changed size.
-    ///
-    /// This is the only place `in_flight` is cleared on the success path, and
-    /// the only honest place to measure the settled size — an idle callback
-    /// runs before the compositor's configure lands and reads a stale value,
-    /// which is what produced the bogus mismatch markers.
     fn on_allocation(self: &Rc<Self>, width: i32, height: i32) {
         let allocated = (width, height);
         self.last_allocated.set(Some(allocated));
@@ -247,14 +414,14 @@ impl Panel {
 
     /// What the drag gesture decided, beside what the motion controller
     /// decided. If the two disagree they are not measuring the same rectangle.
-    fn debug_drag_begin(&self, x: f64, y: f64, size: (i32, i32), zone: geom::Zone) {
+    fn debug_drag_begin(&self, x: f64, y: f64, size: (i32, i32), zone: Zone) {
         if std::env::var_os("GNOMON_DEBUG_GEOM").is_none() {
             return;
         }
         let (mx, my) = self.last_motion.get();
         eprintln!(
             "gnomon geom[drag-begin]: gesture=({:.1},{:.1}) size={}x{} zone={:?} mode={} \
-| motion=({:.1},{:.1}) zone={:?}",
+| motion=({:.1},{:.1}) zone={:?} rows={}",
             x,
             y,
             size.0,
@@ -264,6 +431,17 @@ impl Panel {
             mx,
             my,
             self.last_motion_zone.get(),
+            self.content.row_count(),
+        );
+    }
+
+    fn debug_tear(&self, kind: &str, margins: Margins) {
+        if std::env::var_os("GNOMON_DEBUG_GEOM").is_none() {
+            return;
+        }
+        eprintln!(
+            "gnomon geom[tear]: kind={kind} new panel at {},{}",
+            margins.left, margins.top,
         );
     }
 
@@ -290,13 +468,131 @@ margin_left={} margin_top={} anchors={} pinned={}",
     }
 }
 
+/// Owns every panel. The only thing that knows how many windows exist.
+pub struct Layout {
+    app: adw::Application,
+    toplevel: bool,
+    panels: RefCell<Vec<Rc<Panel>>>,
+}
+
+impl Layout {
+    fn new(app: &adw::Application, toplevel: bool) -> Rc<Layout> {
+        Rc::new(Layout {
+            app: app.clone(),
+            toplevel,
+            panels: RefCell::new(Vec::new()),
+        })
+    }
+
+    /// The startup panel: one window, every kind, monitor-derived position.
+    fn spawn_initial(self: &Rc<Self>) {
+        let panel = Panel::new(
+            self,
+            Vec::new(),
+            Margins {
+                left: geom::EDGE_GAP,
+                top: geom::EDGE_GAP,
+            },
+            DEFAULT_SIZE,
+        );
+        panel.auto_place.set(true);
+        self.panels.borrow_mut().push(panel);
+    }
+
+    fn add(self: &Rc<Self>, panel: Rc<Panel>) {
+        self.panels.borrow_mut().push(panel);
+    }
+
+    fn remove(self: &Rc<Self>, panel: &Rc<Panel>) {
+        self.panels.borrow_mut().retain(|p| !Rc::ptr_eq(p, panel));
+        panel.close();
+    }
+
+    fn count(&self) -> usize {
+        self.panels.borrow().len()
+    }
+
+    /// One feed, many panels: every panel sees every snapshot and renders the
+    /// subset it owns.
+    fn dispatch(&self, update: Update) {
+        let panels = self.panels.borrow().clone();
+        match update {
+            Update::Snapshot(snapshot, _origin) => {
+                for panel in &panels {
+                    panel.content.apply_snapshot(&snapshot);
+                }
+            }
+            Update::Error(message) => {
+                for panel in &panels {
+                    panel.content.show_error(&message);
+                }
+            }
+        }
+    }
+
+    /// The nearest other panel within the merge threshold, if any.
+    fn merge_target(&self, dragged: &Rc<Panel>) -> Option<Rc<Panel>> {
+        let rect = dragged.rect();
+        let mut best: Option<(i32, Rc<Panel>)> = None;
+
+        for other in self.panels.borrow().iter() {
+            if Rc::ptr_eq(other, dragged) {
+                continue;
+            }
+            let other_rect = other.rect();
+            if !geom::rects_within(rect, other_rect, geom::MERGE_THRESHOLD) {
+                continue;
+            }
+            // Ranked by gap so the closest wins when several are in range.
+            let gap = geom::rect_gap(rect, other_rect);
+            let closer = match &best {
+                Some((best_gap, _)) => gap < *best_gap,
+                None => true,
+            };
+            if closer {
+                best = Some((gap, other.clone()));
+            }
+        }
+
+        best.map(|(_, panel)| panel)
+    }
+
+    /// The stationary panel absorbs the dragged one, keeping its own position,
+    /// size and pin state. The dragged window is destroyed.
+    fn merge(self: &Rc<Self>, dragged: &Rc<Panel>, into: &Rc<Panel>) {
+        into.content.absorb(dragged.content.kinds());
+        self.remove(dragged);
+
+        if std::env::var_os("GNOMON_DEBUG_GEOM").is_some() {
+            eprintln!(
+                "gnomon geom[merge]: absorbed, {} panels remain",
+                self.count()
+            );
+        }
+    }
+
+    /// SIGUSR1: if any panel is pinned, unpin them all; otherwise pin them all.
+    ///
+    /// Asymmetric on purpose. A click-through panel cannot be clicked to
+    /// recover, so the signal must always be able to reach a state where every
+    /// panel is interactive again.
+    fn toggle_all_pins(self: &Rc<Self>) {
+        let panels = self.panels.borrow().clone();
+        let any_pinned = panels.iter().any(|p| p.pinned.get());
+
+        for panel in &panels {
+            set_pinned(panel, !any_pinned);
+        }
+    }
+}
+
 /// Run the GUI. `toplevel` skips layer-shell entirely — a debugging escape
 /// hatch for compositors where the layer surface misbehaves.
 pub fn run(toplevel: bool) -> glib::ExitCode {
     let app = adw::Application::builder().application_id(APP_ID).build();
 
     app.connect_startup(|_| load_css());
-    app.connect_activate(move |app| build_window(app, toplevel));
+    app.connect_activate(move |app| build_layout(app, toplevel));
     app.connect_shutdown(|_| pin::remove_pid_file());
 
     // Our own flags are already parsed; do not hand them to GTK.
@@ -323,146 +619,37 @@ fn load_css() {
     }
 }
 
-fn build_window(app: &adw::Application, toplevel: bool) {
+fn build_layout(app: &adw::Application, toplevel: bool) {
     // Before any other thread exists, so they all inherit the blocked mask.
     let (sig_tx, sig_rx) = async_channel::unbounded::<()>();
     pin::watch_sigusr1(sig_tx);
 
-    let win = adw::ApplicationWindow::builder()
-        .application(app)
-        .default_width(DEFAULT_SIZE.0)
-        .default_height(DEFAULT_SIZE.1)
-        .resizable(true)
-        .title("gnomon")
-        .build();
+    let layout = Layout::new(app, toplevel);
+    layout.spawn_initial();
 
-    // A layer surface negotiates from the default size; the size request must
-    // never become a floor under it.
-    win.set_size_request(1, 1);
-
-    if !toplevel {
-        // Scopes the transparency rule, so --toplevel keeps a solid window.
-        win.add_css_class("gnomon-layer");
-
-        // All of this must happen before the window is realized.
-        win.init_layer_shell();
-        win.set_layer(Layer::Overlay);
-        // Anchored Top+Left so the margins are an absolute position.
-        win.set_anchor(Edge::Top, true);
-        win.set_anchor(Edge::Left, true);
-        win.set_anchor(Edge::Right, false);
-        win.set_anchor(Edge::Bottom, false);
-        win.set_margin(Edge::Top, geom::EDGE_GAP);
-        win.set_margin(Edge::Left, geom::EDGE_GAP);
-        // Never take focus, in either pin state. Never reserve space.
-        win.set_keyboard_mode(KeyboardMode::None);
-        win.set_exclusive_zone(0);
-    }
-
-    let content = window::build();
-    win.set_content(Some(&content.overlay));
-
-    let panel = Rc::new(Panel {
-        win: win.clone(),
-        pinned: Cell::new(false),
-        margins: Cell::new(Margins {
-            left: geom::EDGE_GAP,
-            top: geom::EDGE_GAP,
-        }),
-        drag_origin: Cell::new(Margins {
-            left: geom::EDGE_GAP,
-            top: geom::EDGE_GAP,
-        }),
-        resize_origin: Cell::new(DEFAULT_SIZE),
-        drag_zone: Cell::new(geom::Zone::None),
-        grab: Cell::new((0.0, 0.0)),
-        last_motion: Cell::new((-1.0, -1.0)),
-        last_motion_zone: Cell::new(geom::Zone::None),
-        target: Cell::new(None),
-        in_flight: Cell::new(None),
-        in_flight_frames: Cell::new(0),
-        last_requested: Cell::new(None),
-        last_allocated: Cell::new(None),
-        resize_phase: Cell::new("resize"),
-        monitor: Cell::new((0, 0)),
-        default_size: DEFAULT_SIZE,
-        layered: !toplevel,
-    });
-
-    // One request per frame, decided by the flow control in tick_resize.
+    // One feed for every panel.
     {
-        let panel = panel.clone();
-        win.add_tick_callback(move |_, _| {
-            panel.tick_resize();
-            glib::ControlFlow::Continue
+        let layout = layout.clone();
+        let (tx, rx) = async_channel::unbounded::<Update>();
+        feed::spawn(tx);
+        glib::spawn_future_local(async move {
+            while let Ok(update) = rx.recv().await {
+                layout.dispatch(update);
+            }
         });
     }
 
-    // The probe's resize signal is the real "the surface changed size" event.
+    // SIGUSR1 toggles every panel at once.
     {
-        let panel = panel.clone();
-        content.probe.connect_resize(move |_, width, height| {
-            panel.on_allocation(width, height);
-        });
-    }
-
-    // Every pointer path is attached to the overlay so they share one
-    // coordinate space, and all of them measure against the window's own size.
-    wire_drag(&panel, &content.overlay, content.set_resizing.clone());
-    if !toplevel {
-        // In toplevel mode the compositor owns resizing entirely, so neither
-        // the resize gesture nor its cursors belong here.
-        wire_right_button_resize(&panel, &content.overlay, content.set_resizing.clone());
-        wire_cursor(&panel, &content.overlay);
-    }
-    wire_signal(&panel, sig_rx);
-
-    {
-        let panel = panel.clone();
-        win.connect_realize(move |win| {
-            place_initially(&panel);
-            watch_surface(&panel, win);
+        let layout = layout.clone();
+        glib::spawn_future_local(async move {
+            while sig_rx.recv().await.is_ok() {
+                layout.toggle_all_pins();
+            }
         });
     }
 
     pin::write_pid_file();
-    win.present();
-}
-
-/// Monitor geometry, and the initial top-right position derived from it.
-///
-/// The monitor is found from the realized surface, which is the only way to
-/// learn which output the compositor actually put us on.
-fn place_initially(panel: &Rc<Panel>) {
-    let monitor = monitor_size(&panel.win);
-    panel.monitor.set(monitor);
-
-    if !panel.layered {
-        return;
-    }
-
-    // Deliberately NOT panel_size(): at realize the window has not been
-    // allocated, so its width reads 0 and the panel lands off-screen right.
-    let size = panel.default_size;
-
-    let (margins, source) = if monitor.0 > 0 && monitor.1 > 0 {
-        (
-            geom::initial_margins(size, monitor),
-            "configured default size",
-        )
-    } else {
-        // Monitor unknown: do not compute an offset at all.
-        (
-            Margins {
-                left: geom::EDGE_GAP,
-                top: geom::EDGE_GAP,
-            },
-            "monitor unknown, no offset computed",
-        )
-    };
-
-    panel.margins.set(margins);
-    panel.apply_margins("realize", size, source);
 }
 
 /// Ask the display which monitor holds our surface, then read its geometry.
@@ -491,28 +678,11 @@ fn monitor_size(win: &adw::ApplicationWindow) -> (i32, i32) {
     }
 }
 
-/// Re-apply the input region whenever the surface is laid out again.
-///
-/// A move or a resize produces a new configuration and drops the region, so
-/// applying it once at startup is not enough.
-fn watch_surface(panel: &Rc<Panel>, win: &adw::ApplicationWindow) {
-    pin::apply_input_region(win, panel.pinned.get());
-
-    let Some(surface) = win.surface() else {
-        return;
-    };
-
-    let panel = panel.clone();
-    surface.connect_layout(move |_, _, _| {
-        pin::apply_input_region(&panel.win, panel.pinned.get());
-    });
-}
-
-/// One gesture, two modes. The mode is decided at drag-begin from the zone
-/// under the press and never changes for the rest of the sequence.
-fn wire_drag(panel: &Rc<Panel>, overlay: &gtk::Overlay, set_resizing: Rc<dyn Fn(bool)>) {
+/// One gesture, three outcomes: resize, tear-off, or move. The mode is decided
+/// at drag-begin and never changes for the rest of the sequence.
+fn wire_drag(panel: &Rc<Panel>) {
     let drag = gtk::GestureDrag::new();
-    drag.set_button(gtk::gdk::BUTTON_PRIMARY);
+    drag.set_button(gdk::BUTTON_PRIMARY);
     // Capture: see the press before any child can consume it. The 8px band sits
     // over the ScrolledWindow and the root box, either of which could otherwise
     // take the sequence first.
@@ -520,10 +690,12 @@ fn wire_drag(panel: &Rc<Panel>, overlay: &gtk::Overlay, set_resizing: Rc<dyn Fn(
 
     {
         let panel = panel.clone();
-        let set_resizing = set_resizing.clone();
         drag.connect_drag_begin(move |_, x, y| {
+            *panel.drag_target.borrow_mut() = None;
+            *panel.drag_row.borrow_mut() = None;
+
             if panel.pinned.get() {
-                panel.drag_zone.set(geom::Zone::None);
+                panel.drag_zone.set(Zone::None);
                 return;
             }
 
@@ -534,10 +706,22 @@ fn wire_drag(panel: &Rc<Panel>, overlay: &gtk::Overlay, set_resizing: Rc<dyn Fn(
             panel.drag_zone.set(zone);
             panel.grab.set((x, y));
             panel.drag_origin.set(panel.margins.get());
-            panel.resize_origin.set(panel.panel_size());
+            panel.resize_origin.set(size);
+
+            // An edge press always resizes and never tears. A row press only
+            // becomes a candidate for tearing when there is more than one row
+            // to tear from.
+            if !zone.is_resize() && panel.content.row_count() >= 2 {
+                if let Some(kind) = panel.content.kind_at(y) {
+                    panel
+                        .drag_row_top
+                        .set(panel.content.row_top(&kind).unwrap_or(y));
+                    *panel.drag_row.borrow_mut() = Some(kind);
+                }
+            }
 
             if zone.is_resize() {
-                set_resizing(true);
+                (panel.content.set_resizing)(true);
             }
         });
     }
@@ -548,14 +732,35 @@ fn wire_drag(panel: &Rc<Panel>, overlay: &gtk::Overlay, set_resizing: Rc<dyn Fn(
             if panel.pinned.get() || !panel.layered {
                 return;
             }
-            let zone = panel.drag_zone.get();
 
+            // Once torn, this gesture drives the NEW panel and the source stays
+            // exactly where it is.
+            let torn = panel.drag_target.borrow().clone();
+            if let Some(target) = torn {
+                target.apply_move(dx, dy);
+                return;
+            }
+
+            let zone = panel.drag_zone.get();
             if zone.is_resize() {
                 let point = panel.pointer_in_monitor(dx, dy);
                 panel.apply_resize(zone, point, "resize-edge");
-            } else {
-                panel.apply_move(dx, dy);
+                return;
             }
+
+            // Far enough to mean it, and a row under the press: tear.
+            if dx.hypot(dy) > geom::TEAR_THRESHOLD {
+                let kind = panel.drag_row.borrow().clone();
+                if let Some(kind) = kind {
+                    if let Some(new_panel) = tear_off(&panel, &kind, dx, dy) {
+                        *panel.drag_target.borrow_mut() = Some(new_panel);
+                        *panel.drag_row.borrow_mut() = None;
+                        return;
+                    }
+                }
+            }
+
+            panel.apply_move(dx, dy);
         });
     }
 
@@ -563,27 +768,86 @@ fn wire_drag(panel: &Rc<Panel>, overlay: &gtk::Overlay, set_resizing: Rc<dyn Fn(
         let panel = panel.clone();
         drag.connect_drag_end(move |_, _, _| {
             let zone = panel.drag_zone.get();
-            panel.drag_zone.set(geom::Zone::None);
+            panel.drag_zone.set(Zone::None);
+            *panel.drag_row.borrow_mut() = None;
+
+            // Whoever was actually being moved is who settles.
+            let torn = panel.drag_target.borrow().clone();
+            *panel.drag_target.borrow_mut() = None;
+            let moved = torn.unwrap_or_else(|| panel.clone());
 
             if zone.is_resize() {
-                set_resizing(false);
+                (panel.content.set_resizing)(false);
                 return;
             }
             if panel.pinned.get() || !panel.layered {
                 return;
             }
-            let m = panel.margins.get();
-            let snapped = geom::snap_margins(m.left, m.top, panel.panel_size(), panel.monitor.get());
-            panel.margins.set(snapped);
-            panel.apply_margins("snap", panel.panel_size(), "allocated");
+
+            // Merge takes priority: snapping a panel that is about to be
+            // absorbed would just be wasted motion.
+            if let Some(layout) = moved.layout.upgrade() {
+                if let Some(into) = layout.merge_target(&moved) {
+                    layout.merge(&moved, &into);
+                    return;
+                }
+            }
+
+            let m = moved.margins.get();
+            let snapped =
+                geom::snap_margins(m.left, m.top, moved.panel_size(), moved.monitor.get());
+            moved.margins.set(snapped);
+            moved.apply_margins("snap", moved.panel_size(), "allocated");
         });
     }
 
-    overlay.add_controller(drag);
+    panel.content.overlay.add_controller(drag);
+}
+
+/// Detach one row into a panel of its own.
+///
+/// The new panel is placed so the pointer keeps the same position within the
+/// torn row that it had before the tear, and its drag origin is back-dated so
+/// the source panel's still-running gesture drives it seamlessly.
+fn tear_off(panel: &Rc<Panel>, kind: &str, dx: f64, dy: f64) -> Option<Rc<Panel>> {
+    let layout = panel.layout.upgrade()?;
+
+    let (gx, gy) = panel.grab.get();
+    let row_top = panel.drag_row_top.get();
+    // Where the pointer sat inside the row, which is where it should sit inside
+    // the new panel.
+    let new_grab = (gx, gy - row_top);
+
+    let pointer = panel.pointer_in_monitor(dx, dy);
+    let placed = Margins {
+        left: pointer.0 - new_grab.0 as i32,
+        top: pointer.1 - new_grab.1 as i32,
+    };
+
+    let size = panel.panel_size();
+
+    // The source loses the row, and materialises its wildcard in the process.
+    panel.content.remove_kind(kind);
+
+    let new_panel = Panel::new(&layout, vec![kind.to_string()], placed, size);
+    new_panel.monitor.set(panel.monitor.get());
+
+    // Back-date the origin so `origin + cumulative offset` lands on `placed`
+    // right now, and tracks the pointer from here on.
+    new_panel.grab.set(new_grab);
+    new_panel.drag_origin.set(Margins {
+        left: placed.left - dx as i32,
+        top: placed.top - dy as i32,
+    });
+    new_panel.resize_origin.set(size);
+
+    panel.debug_tear(kind, placed);
+    layout.add(new_panel.clone());
+    Some(new_panel)
 }
 
 /// Track the pointer and show the matching resize cursor.
-fn wire_cursor(panel: &Rc<Panel>, overlay: &gtk::Overlay) {
+fn wire_cursor(panel: &Rc<Panel>) {
     let motion = gtk::EventControllerMotion::new();
 
     {
@@ -609,32 +873,47 @@ fn wire_cursor(panel: &Rc<Panel>, overlay: &gtk::Overlay) {
         motion.connect_leave(move |_| panel.win.set_cursor(None));
     }
 
-    overlay.add_controller(motion);
+    panel.content.overlay.add_controller(motion);
+}
+
+/// Middle-click toggles THIS panel's pin.
+///
+/// Only reachable while unpinned, which is correct: a click-through panel
+/// cannot be clicked, and SIGUSR1 is the escape hatch.
+fn wire_middle_click(panel: &Rc<Panel>) {
+    let click = gtk::GestureClick::new();
+    click.set_button(gdk::BUTTON_MIDDLE);
+    click.set_propagation_phase(gtk::PropagationPhase::Capture);
+
+    {
+        let panel = panel.clone();
+        click.connect_pressed(move |gesture, _, _, _| {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            set_pinned(&panel, !panel.pinned.get());
+        });
+    }
+
+    panel.content.overlay.add_controller(click);
 }
 
 /// Right-button drag resizes from the bottom-right, wherever it starts.
 ///
 /// The edge zones are only 8px, so this stays the forgiving way to resize.
-fn wire_right_button_resize(
-    panel: &Rc<Panel>,
-    overlay: &gtk::Overlay,
-    set_resizing: Rc<dyn Fn(bool)>,
-) {
+fn wire_right_button_resize(panel: &Rc<Panel>) {
     let drag = gtk::GestureDrag::new();
-    drag.set_button(gtk::gdk::BUTTON_SECONDARY);
+    drag.set_button(gdk::BUTTON_SECONDARY);
     // Same widget and same phase as the primary drag, so both read the same
     // coordinate space.
     drag.set_propagation_phase(gtk::PropagationPhase::Capture);
 
     {
         let panel = panel.clone();
-        let set_resizing = set_resizing.clone();
         drag.connect_drag_begin(move |gesture, x, y| {
             gesture.set_state(gtk::EventSequenceState::Claimed);
             panel.grab.set((x, y));
             panel.drag_origin.set(panel.margins.get());
             panel.resize_origin.set(panel.panel_size());
-            set_resizing(true);
+            (panel.content.set_resizing)(true);
         });
     }
 
@@ -645,23 +924,16 @@ fn wire_right_button_resize(
                 return;
             }
             let point = panel.pointer_in_monitor(dx, dy);
-            panel.apply_resize(geom::Zone::BottomRight, point, "resize-rmb");
+            panel.apply_resize(Zone::BottomRight, point, "resize-rmb");
         });
     }
 
-    drag.connect_drag_end(move |_, _, _| set_resizing(false));
+    {
+        let panel = panel.clone();
+        drag.connect_drag_end(move |_, _, _| (panel.content.set_resizing)(false));
+    }
 
-    overlay.add_controller(drag);
-}
-
-/// Drain the SIGUSR1 channel on the main thread and toggle the pin there.
-fn wire_signal(panel: &Rc<Panel>, rx: async_channel::Receiver<()>) {
-    let panel = panel.clone();
-    glib::spawn_future_local(async move {
-        while rx.recv().await.is_ok() {
-            set_pinned(&panel, !panel.pinned.get());
-        }
-    });
+    panel.content.overlay.add_controller(drag);
 }
 
 fn set_pinned(panel: &Rc<Panel>, pinned: bool) {
@@ -669,14 +941,12 @@ fn set_pinned(panel: &Rc<Panel>, pinned: bool) {
 
     if pinned {
         panel.win.add_css_class("pinned");
+        // No resize cursors on a click-through panel.
+        panel.win.set_cursor(None);
     } else {
         panel.win.remove_css_class("pinned");
     }
 
-    if pinned {
-        // No resize cursors on a click-through panel.
-        panel.win.set_cursor(None);
-    }
     pin::apply_input_region(&panel.win, pinned);
 
     eprintln!(

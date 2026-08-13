@@ -1,14 +1,15 @@
 //! Widget tree and update handling. Every call here runs on the main thread.
+//!
+//! One `Content` per panel. It owns the rows it renders and knows nothing about
+//! the feed, which belongs to the layout: there is one feed for many panels.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use chrono::{DateTime, Utc};
 use gnomon_core::{LimitWindow, UsageSnapshot};
-use gtk::{glib, pango};
 use gtk::prelude::*;
-
-use crate::feed::{self, Update};
+use gtk::{glib, pango};
 
 use crate::geom;
 
@@ -17,14 +18,24 @@ const SEVERITY_CLASSES: [&str; 3] = ["sev-normal", "sev-warning", "sev-error"];
 const SPACING: i32 = 14;
 const SPACING_TIGHT: i32 = 6;
 
-/// One rendered limit window, kept so the countdown can tick without a rebuild.
+/// One rendered limit window, kept so the countdown can tick without a rebuild
+/// and so a drag can tell which row it started on.
 struct Row {
+    container: gtk::Box,
+    kind: String,
     countdown: gtk::Label,
     resets_at: Option<DateTime<Utc>>,
 }
 
 /// What is currently on screen.
 struct State {
+    /// Kinds this panel renders. EMPTY means "everything" — the state the
+    /// single M4 panel is in, so new kinds appear without configuration.
+    kinds: Vec<String>,
+    /// The most recent full snapshot, so a change of kinds can re-filter
+    /// without waiting for the next poll.
+    all: Vec<LimitWindow>,
+    /// What is actually rendered: `all` filtered by `kinds`.
     windows: Vec<LimitWindow>,
     rows: Vec<Row>,
     loaded: bool,
@@ -41,10 +52,145 @@ pub struct Content {
     /// Called with true when an interactive resize starts and false when it
     /// ends, so the expensive rebuild can be deferred to the end.
     pub set_resizing: Rc<dyn Fn(bool)>,
+    root: gtk::Box,
+    status: gtk::Label,
+    state: Rc<RefCell<State>>,
 }
 
-/// Build the content tree, start the feed, and wire up updates.
-pub fn build() -> Content {
+/// Filter a snapshot down to the kinds a panel renders, in snapshot order.
+fn visible(kinds: &[String], all: &[LimitWindow]) -> Vec<LimitWindow> {
+    if kinds.is_empty() {
+        return all.to_vec();
+    }
+    all.iter()
+        .filter(|w| kinds.iter().any(|k| k == &w.kind))
+        .cloned()
+        .collect()
+}
+
+impl Content {
+    /// Kinds this panel renders. Empty means "everything".
+    pub fn kinds(&self) -> Vec<String> {
+        self.state.borrow().kinds.clone()
+    }
+
+    /// Number of rows currently on screen.
+    pub fn row_count(&self) -> usize {
+        self.state.borrow().rows.len()
+    }
+
+    /// Replace the kind list and re-render from the last snapshot.
+    pub fn set_kinds(&self, kinds: Vec<String>) {
+        {
+            let mut s = self.state.borrow_mut();
+            s.kinds = kinds;
+            s.windows = visible(&s.kinds, &s.all);
+        }
+        self.rerender();
+    }
+
+    /// Append another panel's kinds to this one. An empty list is the wildcard,
+    /// so absorbing one makes this panel the wildcard too.
+    pub fn absorb(&self, kinds: Vec<String>) {
+        let mut merged = self.kinds();
+        if merged.is_empty() || kinds.is_empty() {
+            merged = Vec::new();
+        } else {
+            for kind in kinds {
+                if !merged.contains(&kind) {
+                    merged.push(kind);
+                }
+            }
+        }
+        self.set_kinds(merged);
+    }
+
+    /// Drop one kind. A wildcard panel is first materialised into the explicit
+    /// list of what it currently shows, so the removal has something to bite on.
+    pub fn remove_kind(&self, kind: &str) {
+        let mut kinds = self.kinds();
+        if kinds.is_empty() {
+            kinds = self
+                .state
+                .borrow()
+                .windows
+                .iter()
+                .map(|w| w.kind.clone())
+                .collect();
+        }
+        kinds.retain(|k| k != kind);
+        self.set_kinds(kinds);
+    }
+
+    /// Which row's kind sits at this overlay-local y, if any.
+    pub fn kind_at(&self, y: f64) -> Option<String> {
+        let state = self.state.borrow();
+        for row in &state.rows {
+            if let Some(b) = row.container.compute_bounds(&self.overlay) {
+                if y >= b.y() as f64 && y <= (b.y() + b.height()) as f64 {
+                    return Some(row.kind.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// The top of a row in overlay-local coordinates.
+    pub fn row_top(&self, kind: &str) -> Option<f64> {
+        let state = self.state.borrow();
+        state
+            .rows
+            .iter()
+            .find(|r| r.kind == kind)
+            .and_then(|r| r.container.compute_bounds(&self.overlay))
+            .map(|b| b.y() as f64)
+    }
+
+    /// Store a snapshot and re-render if what this panel shows changed.
+    ///
+    /// A panel whose kinds are all absent from the snapshot keeps its existing
+    /// rows: an empty result means "nothing to say about these", not "these are
+    /// gone".
+    pub fn apply_snapshot(&self, snapshot: &UsageSnapshot) {
+        let changed = {
+            let mut s = self.state.borrow_mut();
+            s.all = snapshot.windows.clone();
+
+            let next = visible(&s.kinds, &s.all);
+
+            // Two distinct reasons to leave the rows alone, both no-ops:
+            // nothing in this snapshot concerns us, or nothing changed.
+            let nothing_for_us = next.is_empty() && s.loaded;
+            let unchanged = s.loaded && s.windows == next;
+
+            if nothing_for_us || unchanged {
+                false
+            } else {
+                s.windows = next;
+                s.loaded = true;
+                true
+            }
+        };
+
+        if changed {
+            self.rerender();
+        } else {
+            self.status.set_visible(false);
+        }
+    }
+
+    pub fn show_error(&self, message: &str) {
+        self.status.set_text(message);
+        self.status.set_visible(true);
+    }
+
+    fn rerender(&self) {
+        render(&self.root, &self.status, &self.state);
+    }
+}
+
+/// Build the content tree for one panel.
+pub fn build(kinds: Vec<String>) -> Content {
     // No widget margins: #root's 16px CSS padding provides the inset *inside*
     // the painted background. Margins would push the background away from the
     // surface edge, leaving a dead transparent band around the panel.
@@ -66,6 +212,8 @@ pub fn build() -> Content {
     status.add_css_class("dim-label");
 
     let state = Rc::new(RefCell::new(State {
+        kinds,
+        all: Vec::new(),
         windows: Vec::new(),
         rows: Vec::new(),
         loaded: false,
@@ -94,34 +242,6 @@ pub fn build() -> Content {
     debug_css_on_realize(&root);
     let (probe, set_resizing) = watch_width(&overlay, &root, &status, &state);
 
-    let (tx, rx) = async_channel::unbounded::<Update>();
-    feed::spawn(tx);
-
-    {
-        let root = root.clone();
-        let status = status.clone();
-        let state = state.clone();
-        glib::spawn_future_local(async move {
-            while let Ok(update) = rx.recv().await {
-                match update {
-                    Update::Snapshot(snapshot, _origin) => {
-                        if apply(&state, snapshot) {
-                            render(&root, &status, &state);
-                        } else {
-                            // Payload unchanged: clear any stale error without
-                            // rebuilding the bars.
-                            status.set_visible(false);
-                        }
-                    }
-                    Update::Error(message) => {
-                        status.set_text(&message);
-                        status.set_visible(true);
-                    }
-                }
-            }
-        });
-    }
-
     // Countdowns tick locally. This must never touch the network or the socket.
     {
         let state = state.clone();
@@ -137,15 +257,18 @@ pub fn build() -> Content {
         overlay,
         probe,
         set_resizing,
+        root,
+        status,
+        state,
     }
 }
 
-/// Track the panel's width from its allocation, not from a timer.
+/// Track the panel's size from its allocation, not from a timer.
 ///
 /// GTK 4 removed the consumer-facing `size-allocate` signal, and `GtkWidget`
-/// exposes no notifiable width property. A zero-height `GtkDrawingArea` that
-/// spans the row does have a `resize` signal, and it fires on allocation — so
-/// it serves as an allocation probe without drawing anything.
+/// exposes no notifiable width property. A `GtkDrawingArea` filling the overlay
+/// does have a `resize` signal, and it fires on allocation — so it serves as an
+/// allocation probe without drawing anything.
 fn watch_width(
     overlay: &gtk::Overlay,
     root: &gtk::Box,
@@ -299,22 +422,6 @@ fn debug_css_on_realize(root: &gtk::Box) {
     });
 }
 
-/// Store a snapshot. Returns true when the screen needs rebuilding.
-///
-/// Both transports report the same server state, so the most recently received
-/// snapshot wins regardless of origin — but an identical payload is dropped.
-fn apply(state: &Rc<RefCell<State>>, snapshot: UsageSnapshot) -> bool {
-    let mut state = state.borrow_mut();
-
-    if state.loaded && state.windows == snapshot.windows {
-        return false;
-    }
-
-    state.windows = snapshot.windows;
-    state.loaded = true;
-    true
-}
-
 /// Rebuild the children of `root` from the stored state.
 fn render(root: &gtk::Box, status: &gtk::Label, state: &Rc<RefCell<State>>) {
     // The probe lives in the overlay, so rebuilding the box's children cannot
@@ -401,13 +508,14 @@ fn build_row(window: &LimitWindow, compact: bool) -> (gtk::Box, Row) {
     container.append(&bar);
     container.append(&countdown_label);
 
-    (
-        container,
-        Row {
-            countdown: countdown_label,
-            resets_at: window.resets_at,
-        },
-    )
+    let row = Row {
+        container: container.clone(),
+        kind: window.kind.clone(),
+        countdown: countdown_label,
+        resets_at: window.resets_at,
+    };
+
+    (container, row)
 }
 
 /// Apply exactly one severity class, so they cannot accumulate.

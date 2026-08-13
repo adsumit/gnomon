@@ -155,6 +155,68 @@ pub fn drag_point(origin: Margins, grab: (i32, i32), dx: i32, dy: i32) -> (i32, 
     (origin.left + grab.0 + dx, origin.top + grab.1 + dy)
 }
 
+/// A drag on a row must exceed this before it tears the row into its own panel.
+pub const TEAR_THRESHOLD: f64 = 40.0;
+/// Two panels closer than this at drag-end merge.
+pub const MERGE_THRESHOLD: i32 = 60;
+
+/// A panel's rectangle in monitor space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rect {
+    pub left: i32,
+    pub top: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl Rect {
+    pub fn new(margins: Margins, size: (i32, i32)) -> Self {
+        Rect {
+            left: margins.left,
+            top: margins.top,
+            width: size.0,
+            height: size.1,
+        }
+    }
+}
+
+/// Shortest distance between two rectangles. Zero when they touch or overlap.
+///
+/// Separation on both axes is a corner-to-corner gap, so the two components
+/// combine as a hypotenuse rather than as a maximum — otherwise two panels
+/// diagonally apart would read as closer than they look.
+pub fn rect_gap(a: Rect, b: Rect) -> i32 {
+    let dx = if a.left + a.width < b.left {
+        b.left - (a.left + a.width)
+    } else if b.left + b.width < a.left {
+        a.left - (b.left + b.width)
+    } else {
+        0
+    };
+
+    let dy = if a.top + a.height < b.top {
+        b.top - (a.top + a.height)
+    } else if b.top + b.height < a.top {
+        a.top - (b.top + b.height)
+    } else {
+        0
+    };
+
+    if dx == 0 {
+        return dy;
+    }
+    if dy == 0 {
+        return dx;
+    }
+
+    (((dx * dx + dy * dy) as f64).sqrt()) as i32
+}
+
+/// Are these two rectangles within `threshold` of each other?
+pub fn rects_within(a: Rect, b: Rect, threshold: i32) -> bool {
+    rect_gap(a, b) <= threshold
+}
+
 /// Thickness of the interactive edge and corner resize band.
 pub const RESIZE_EDGE: i32 = 8;
 
@@ -637,6 +699,83 @@ mod tests {
             chained,
             drag_point(ORIGIN, grab, 60, 0),
             "using moved margins as the base must NOT agree — that is the bug"
+        );
+    }
+
+    // ---- rectangle proximity ----
+
+    fn rect(left: i32, top: i32, width: i32, height: i32) -> Rect {
+        Rect { left, top, width, height }
+    }
+
+    #[test]
+    fn gap_is_zero_when_overlapping() {
+        let a = rect(100, 100, 300, 150);
+        let b = rect(200, 150, 300, 150);
+        assert_eq!(rect_gap(a, b), 0);
+        assert_eq!(rect_gap(b, a), 0, "the measure is symmetric");
+    }
+
+    #[test]
+    fn gap_is_zero_when_touching() {
+        // b starts exactly where a ends.
+        let a = rect(100, 100, 300, 150);
+        let b = rect(400, 100, 300, 150);
+        assert_eq!(rect_gap(a, b), 0);
+    }
+
+    #[test]
+    fn gap_at_exactly_the_threshold_merges() {
+        let a = rect(100, 100, 300, 150);
+        let b = rect(460, 100, 300, 150); // 100+300 = 400, then 60 of gap
+        assert_eq!(rect_gap(a, b), MERGE_THRESHOLD);
+        assert!(rects_within(a, b, MERGE_THRESHOLD), "60 is inside the band");
+    }
+
+    #[test]
+    fn gap_one_past_the_threshold_does_not_merge() {
+        let a = rect(100, 100, 300, 150);
+        let b = rect(461, 100, 300, 150);
+        assert_eq!(rect_gap(a, b), MERGE_THRESHOLD + 1);
+        assert!(!rects_within(a, b, MERGE_THRESHOLD));
+    }
+
+    #[test]
+    fn near_on_one_axis_but_far_on_the_other_does_not_merge() {
+        // Horizontally overlapping, but 400px apart vertically.
+        let a = rect(100, 100, 300, 150);
+        let b = rect(100, 650, 300, 150);
+        assert_eq!(rect_gap(a, b), 400);
+        assert!(!rects_within(a, b, MERGE_THRESHOLD));
+    }
+
+    #[test]
+    fn diagonal_corner_proximity_uses_the_hypotenuse() {
+        // 30 apart horizontally and 40 vertically: a 3-4-5 triangle.
+        let a = rect(100, 100, 300, 150);
+        let b = rect(430, 290, 300, 150);
+        assert_eq!(rect_gap(a, b), 50);
+        assert!(rects_within(a, b, MERGE_THRESHOLD));
+
+        // The same separation would be only 40 under a max() rule, which would
+        // wrongly call this pair closer than it is.
+        assert!(rect_gap(a, b) > 40);
+    }
+
+    #[test]
+    fn diagonal_just_outside_the_threshold() {
+        // 60 and 60 apart is a gap of ~84, comfortably outside.
+        let a = rect(100, 100, 300, 150);
+        let b = rect(460, 310, 300, 150);
+        assert_eq!(rect_gap(a, b), 84);
+        assert!(!rects_within(a, b, MERGE_THRESHOLD));
+    }
+
+    #[test]
+    fn rect_from_margins_and_size() {
+        assert_eq!(
+            Rect::new(Margins { left: 12, top: 34 }, (300, 150)),
+            rect(12, 34, 300, 150)
         );
     }
 
