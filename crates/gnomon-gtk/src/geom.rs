@@ -128,6 +128,33 @@ pub fn responsive_state(
     (compact, tight)
 }
 
+/// New margins for a move drag.
+///
+/// `origin` is the margins captured at drag-begin and `(dx, dy)` is the
+/// gesture's cumulative offset from the press point. The origin must be the
+/// drag-begin value on every event — feeding the previous result back in
+/// double-counts the offset and the panel accelerates away from the pointer.
+pub fn move_margins(
+    origin: Margins,
+    dx: i32,
+    dy: i32,
+    panel: (i32, i32),
+    monitor: (i32, i32),
+) -> Margins {
+    clamp_margins(origin.left + dx, origin.top + dy, panel, monitor)
+}
+
+/// The pointer's monitor-space position during a drag.
+///
+/// `origin` and `grab` are captured at drag-begin and `(dx, dy)` is the
+/// gesture's cumulative offset from the press point. All three are drag-begin
+/// values: using the *current* margins here re-adds movement the offset already
+/// contains, which is exactly how the panel came to accelerate away from the
+/// cursor.
+pub fn drag_point(origin: Margins, grab: (i32, i32), dx: i32, dy: i32) -> (i32, i32) {
+    (origin.left + grab.0 + dx, origin.top + grab.1 + dy)
+}
+
 /// Thickness of the interactive edge and corner resize band.
 pub const RESIZE_EDGE: i32 = 8;
 
@@ -475,6 +502,142 @@ mod tests {
         assert_eq!(responsive_state(0, 0, true, true), (true, true));
         assert_eq!(responsive_state(0, 0, false, false), (false, false));
         assert_eq!(responsive_state(300, 0, false, false), (false, false));
+    }
+
+    // ---- drag offsets must not accumulate ----
+    //
+    // GTK's gesture offset is cumulative from the press point, so every event
+    // carries the WHOLE drag. Anything that folds an event's result back in as
+    // the next event's base double-counts, and the panel accelerates away from
+    // the cursor. These pin the property the defect violated.
+
+    const ORIGIN: Margins = Margins { left: 500, top: 300 };
+    /// One drag delivered as three cumulative events.
+    const OFFSETS: [(i32, i32); 3] = [(10, 5), (20, 10), (30, 15)];
+
+    #[test]
+    fn move_depends_only_on_the_latest_offset() {
+        let one_step = move_margins(ORIGIN, 30, 15, S0, MONITOR);
+
+        // Replaying the sequence, always from the drag-begin origin.
+        let mut last = ORIGIN;
+        for (dx, dy) in OFFSETS {
+            last = move_margins(ORIGIN, dx, dy, S0, MONITOR);
+        }
+
+        assert_eq!(last, one_step, "the count of events must not matter");
+        assert_eq!(one_step, Margins { left: 530, top: 315 });
+    }
+
+    #[test]
+    fn move_double_counts_if_fed_its_own_output() {
+        // The 09fc6de defect, pinned. Chaining the result in as the next base
+        // sums every offset: 500 + 10 + 20 + 30.
+        let mut chained = ORIGIN;
+        for (dx, dy) in OFFSETS {
+            chained = move_margins(chained, dx, dy, S0, MONITOR);
+        }
+
+        assert_eq!(chained, Margins { left: 560, top: 330 });
+        assert_ne!(
+            chained,
+            move_margins(ORIGIN, 30, 15, S0, MONITOR),
+            "chaining must NOT agree with the single step — that is the bug"
+        );
+    }
+
+    #[test]
+    fn resize_right_depends_only_on_the_latest_offset() {
+        // Press inside the right edge band.
+        let grab = (295, 75);
+        let point = |dx: i32| (ORIGIN.left + grab.0 + dx, ORIGIN.top + grab.1);
+
+        let one_step = resize_from(Zone::Right, point(60), ORIGIN, S0, MONITOR);
+
+        let mut last = (ORIGIN, S0);
+        for dx in [20, 40, 60] {
+            last = resize_from(Zone::Right, point(dx), ORIGIN, S0, MONITOR);
+        }
+
+        assert_eq!(last, one_step);
+        assert_eq!(last.0, ORIGIN, "a right drag never moves the margins");
+        assert_eq!(last.1 .0, 355, "width follows the pointer: 295 + 60");
+    }
+
+    #[test]
+    fn resize_left_depends_only_on_the_latest_offset() {
+        // Press inside the left edge band, dragging outward (negative dx).
+        let grab = (4, 75);
+        let point = |dx: i32| (ORIGIN.left + grab.0 + dx, ORIGIN.top + grab.1);
+
+        let one_step = resize_from(Zone::Left, point(-60), ORIGIN, S0, MONITOR);
+
+        let mut last = (ORIGIN, S0);
+        for dx in [-20, -40, -60] {
+            last = resize_from(Zone::Left, point(dx), ORIGIN, S0, MONITOR);
+        }
+
+        assert_eq!(last, one_step);
+        assert_eq!(
+            last.0.left + last.1 .0,
+            ORIGIN.left + S0.0,
+            "the right edge stays pinned across the whole sequence"
+        );
+    }
+
+    #[test]
+    fn resize_from_is_anchor_invariant() {
+        // resize_from itself is immune: it always measures from the pinned
+        // opposite edge, which chaining preserves. Feeding its own output back
+        // in changes nothing. The resize defect therefore lived entirely in the
+        // POINT computation, not here — which is what the next two tests cover.
+        let grab = (295, 75);
+        let point = |dx: i32| (ORIGIN.left + grab.0 + dx, ORIGIN.top + grab.1);
+
+        let mut chained = (ORIGIN, S0);
+        for dx in [20, 40, 60] {
+            chained = resize_from(Zone::Right, point(dx), chained.0, chained.1, MONITOR);
+        }
+
+        assert_eq!(chained, resize_from(Zone::Right, point(60), ORIGIN, S0, MONITOR));
+    }
+
+    #[test]
+    fn drag_point_depends_only_on_the_latest_offset() {
+        let grab = (295, 75);
+        let one_step = drag_point(ORIGIN, grab, 60, 0);
+
+        let mut last = (0, 0);
+        for dx in [20, 40, 60] {
+            last = drag_point(ORIGIN, grab, dx, 0);
+        }
+
+        assert_eq!(last, one_step);
+        assert_eq!(one_step, (500 + 295 + 60, 300 + 75));
+    }
+
+    #[test]
+    fn drag_point_double_counts_if_based_on_current_margins() {
+        // The 09fc6de defect in the resize path: recomputing the base from the
+        // margins we just moved re-adds the offset the gesture already carries.
+        let grab = (295, 75);
+        let mut base = ORIGIN;
+        let mut chained = (0, 0);
+
+        for dx in [20, 40, 60] {
+            chained = drag_point(base, grab, dx, 0);
+            // Stand in for a resize having shifted the origin by the offset.
+            base = Margins {
+                left: base.left + dx,
+                top: base.top,
+            };
+        }
+
+        assert_ne!(
+            chained,
+            drag_point(ORIGIN, grab, 60, 0),
+            "using moved margins as the base must NOT agree — that is the bug"
+        );
     }
 
     // ---- zone classification ----

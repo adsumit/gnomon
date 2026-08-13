@@ -72,28 +72,31 @@ impl Panel {
 
     /// The pointer's position in monitor space, from a gesture offset.
     ///
-    /// COORDINATE SPACE. `grab` is the press point in surface-local
-    /// coordinates, and `(dx, dy)` is the gesture offset in that same space, so
-    /// `grab + offset` is the pointer's current surface-local point. Adding the
-    /// *current* margins — which are the surface's origin, because the layer
-    /// surface is anchored Top and Left — lifts it into monitor space.
+    /// COORDINATE SPACE. The reference frame is fixed at drag-begin and never
+    /// re-read: `drag_origin` is the margins at the press, `grab` is the press
+    /// point in surface-local coordinates, and `(dx, dy)` is the gesture's
+    /// offset accumulated from that same press point. Their sum is the
+    /// pointer's monitor-space position.
     ///
-    /// This is self-correcting, which is the whole point. If we move the origin
-    /// by d, a stationary pointer's surface-local coordinate shifts by -d and
-    /// the margin we add shifts by +d, so the monitor-space result is
-    /// unchanged. Accumulated deltas have no such property: the widget the
-    /// gesture is attached to is the widget being resized, so its origin slides
-    /// under the pointer and every delta is measured against a moved ruler.
+    /// The current margins are deliberately NOT consulted. GTK anchors the
+    /// gesture offset to the press point and does not re-measure it when the
+    /// surface origin moves, so the offset already contains every pixel of
+    /// movement we have applied. Adding it to margins that have themselves been
+    /// moved by that offset counts it twice, and the panel accelerates away
+    /// from the cursor at roughly double speed, compounding each event.
     fn pointer_in_monitor(&self, dx: f64, dy: f64) -> (i32, i32) {
         let (gx, gy) = self.grab.get();
-        let m = self.margins.get();
-        (
-            m.left + (gx + dx) as i32,
-            m.top + (gy + dy) as i32,
+        geom::drag_point(
+            self.drag_origin.get(),
+            (gx as i32, gy as i32),
+            dx as i32,
+            dy as i32,
         )
     }
 
     /// Resize from an absolute pointer position.
+    ///
+    /// Anchored on the drag-begin margins and size, for the same reason.
     fn apply_resize(self: &Rc<Self>, zone: geom::Zone, point: (i32, i32), phase: &'static str) {
         let (margins, size) = geom::resize_from(
             zone,
@@ -112,16 +115,16 @@ impl Panel {
         self.target.set(Some(size));
     }
 
-    /// Move so the grabbed point stays under the pointer.
-    fn apply_move(self: &Rc<Self>, point: (i32, i32)) {
-        let (gx, gy) = self.grab.get();
-        let clamped = geom::clamp_margins(
-            point.0 - gx as i32,
-            point.1 - gy as i32,
+    /// Move by the gesture offset, measured from the drag-begin margins.
+    fn apply_move(self: &Rc<Self>, dx: f64, dy: f64) {
+        let moved = geom::move_margins(
+            self.drag_origin.get(),
+            dx as i32,
+            dy as i32,
             self.panel_size(),
             self.monitor.get(),
         );
-        self.margins.set(clamped);
+        self.margins.set(moved);
         self.apply_margins("drag", self.panel_size(), "allocated");
     }
 
@@ -505,13 +508,13 @@ fn wire_drag(panel: &Rc<Panel>, root: &gtk::Box, set_resizing: Rc<dyn Fn(bool)>)
             if panel.pinned.get() || !panel.layered {
                 return;
             }
-            let point = panel.pointer_in_monitor(dx, dy);
             let zone = panel.drag_zone.get();
 
             if zone.is_resize() {
+                let point = panel.pointer_in_monitor(dx, dy);
                 panel.apply_resize(zone, point, "resize-edge");
             } else {
-                panel.apply_move(point);
+                panel.apply_move(dx, dy);
             }
         });
     }
