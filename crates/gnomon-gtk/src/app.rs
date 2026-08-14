@@ -7,6 +7,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
+use gnomon_core::UsageSnapshot;
 use gtk::{gdk, glib};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
@@ -67,6 +68,12 @@ pub struct Panel {
     last_requested: Cell<Option<(i32, i32)>>,
     last_allocated: Cell<Option<(i32, i32)>>,
     resize_phase: Cell<&'static str>,
+
+    /// One-shot traces armed by a tear. The row removal is synchronous but the
+    /// allocation and any size request that follow it are not, so watching the
+    /// source panel across a tear means arming the two later events too.
+    trace_next_alloc: Cell<bool>,
+    trace_next_request: Cell<bool>,
 }
 
 impl Panel {
@@ -114,6 +121,15 @@ impl Panel {
         }
 
         let content = window::build(kinds);
+
+        // Seed from the cached snapshot BEFORE the window is ever shown. The
+        // feed only delivers to panels that exist when an update arrives, and
+        // the OAuth leg polls at 180s, so a panel torn off between polls would
+        // otherwise sit on the loading placeholder for up to three minutes.
+        if let Some(snapshot) = layout.last_snapshot.borrow().as_ref() {
+            content.apply_snapshot(snapshot);
+        }
+
         win.set_content(Some(&content.overlay));
 
         let panel = Rc::new(Panel {
@@ -141,6 +157,8 @@ impl Panel {
             last_requested: Cell::new(None),
             last_allocated: Cell::new(None),
             resize_phase: Cell::new("resize"),
+            trace_next_alloc: Cell::new(false),
+            trace_next_request: Cell::new(false),
         });
 
         // One request per frame, decided by the flow control in tick_resize.
@@ -176,7 +194,11 @@ impl Panel {
             });
         }
 
-        win.present();
+        // Deliberately NOT presented here. `gtk_window_present` realizes the
+        // window synchronously, so `connect_realize` fires before this function
+        // returns — and anything the caller must set up first, such as the
+        // startup panel's auto-placement, would be set too late to be seen.
+        // `Layout::add` presents, and is the only way a panel enters the layout.
         panel
     }
 
@@ -220,6 +242,9 @@ impl Panel {
 
             self.margins.set(margins);
             self.apply_margins("realize", size, source);
+            // Spent. A window can be realized more than once, and a second
+            // pass would drag the panel back to its startup corner.
+            self.auto_place.set(false);
         }
 
         self.watch_surface(win);
@@ -345,6 +370,13 @@ impl Panel {
         self.last_requested.set(Some(target));
         self.win.set_default_size(target.0, target.1);
         self.debug_resize_request(target);
+
+        if self.trace_next_request.replace(false) {
+            self.debug_source(
+                "tear-source-request",
+                &format!("requested={}x{}", target.0, target.1),
+            );
+        }
     }
 
     /// An allocation arrived: the surface has genuinely changed size.
@@ -359,6 +391,30 @@ impl Panel {
         }
 
         self.debug_resize_allocated(allocated);
+
+        if self.trace_next_alloc.replace(false) {
+            self.debug_source("tear-source-alloc", &format!("allocated={width}x{height}"));
+        }
+    }
+
+    /// One line of this panel's position and size, for watching a tear.
+    ///
+    /// `panel_size()` reads the window, which can still be a frame behind an
+    /// allocation, so callers that have a fresher number pass it in `note`.
+    fn debug_source(&self, label: &str, note: &str) {
+        if std::env::var_os("GNOMON_DEBUG_GEOM").is_none() {
+            return;
+        }
+        let m = self.margins.get();
+        let size = self.panel_size();
+        eprintln!(
+            "gnomon geom[{label}]: margin_left={} margin_top={} size={}x{} rows={} {note}",
+            m.left,
+            m.top,
+            size.0,
+            size.1,
+            self.content.row_count(),
+        );
     }
 
     fn debug_resize_request(&self, requested: (i32, i32)) {
@@ -473,6 +529,10 @@ pub struct Layout {
     app: adw::Application,
     toplevel: bool,
     panels: RefCell<Vec<Rc<Panel>>>,
+    /// The most recent snapshot, kept so a panel created between polls can be
+    /// seeded at construction. Without it a torn-off panel has nothing to
+    /// render until the next update, which on the OAuth leg is up to 180s away.
+    last_snapshot: RefCell<Option<UsageSnapshot>>,
 }
 
 impl Layout {
@@ -481,6 +541,7 @@ impl Layout {
             app: app.clone(),
             toplevel,
             panels: RefCell::new(Vec::new()),
+            last_snapshot: RefCell::new(None),
         })
     }
 
@@ -495,12 +556,20 @@ impl Layout {
             },
             DEFAULT_SIZE,
         );
+        // Set BEFORE `add` presents, because presenting realizes the window and
+        // realize is where auto-placement happens.
         panel.auto_place.set(true);
-        self.panels.borrow_mut().push(panel);
+        self.add(panel);
     }
 
+    /// Adopt a panel and show it.
+    ///
+    /// Presenting lives here rather than in `Panel::new` so that a caller can
+    /// finish configuring a panel — placement flag, monitor, back-dated drag
+    /// origin — before the synchronous realize that presenting triggers.
     fn add(self: &Rc<Self>, panel: Rc<Panel>) {
-        self.panels.borrow_mut().push(panel);
+        self.panels.borrow_mut().push(panel.clone());
+        panel.win.present();
     }
 
     fn remove(self: &Rc<Self>, panel: &Rc<Panel>) {
@@ -518,6 +587,10 @@ impl Layout {
         let panels = self.panels.borrow().clone();
         match update {
             Update::Snapshot(snapshot, _origin) => {
+                // Cached first, so a panel born during this dispatch — or at
+                // any point before the next one — has something to render.
+                *self.last_snapshot.borrow_mut() = Some(snapshot.clone());
+
                 for panel in &panels {
                     panel.content.apply_snapshot(&snapshot);
                 }
@@ -561,6 +634,16 @@ impl Layout {
     /// size and pin state. The dragged window is destroyed.
     fn merge(self: &Rc<Self>, dragged: &Rc<Panel>, into: &Rc<Panel>) {
         into.content.absorb(dragged.content.kinds());
+
+        // `absorb` re-filters from the survivor's own copy of the last
+        // snapshot, which the construction-time seeding guarantees is present.
+        // Re-applying the cache here is what makes that a guarantee rather than
+        // an assumption: if the survivor's copy is already current this is a
+        // no-op, and if it somehow is not, the absorbed rows still render.
+        if let Some(snapshot) = self.last_snapshot.borrow().as_ref() {
+            into.content.apply_snapshot(snapshot);
+        }
+
         self.remove(dragged);
 
         if std::env::var_os("GNOMON_DEBUG_GEOM").is_some() {
@@ -748,16 +831,27 @@ fn wire_drag(panel: &Rc<Panel>) {
                 return;
             }
 
-            // Far enough to mean it, and a row under the press: tear.
-            if dx.hypot(dy) > geom::TEAR_THRESHOLD {
-                let kind = panel.drag_row.borrow().clone();
-                if let Some(kind) = kind {
-                    if let Some(new_panel) = tear_off(&panel, &kind, dx, dy) {
-                        *panel.drag_target.borrow_mut() = Some(new_panel);
-                        *panel.drag_row.borrow_mut() = None;
-                        return;
-                    }
+            // A press on a tear-candidate row is an ambiguous gesture: it will
+            // become either a tear or a move, and which one is not known until
+            // it clears the threshold. An ambiguous gesture must move NOTHING.
+            //
+            // Moving the source first and tearing afterwards is what left the
+            // source panel displaced: every update below the threshold wrote
+            // new margins onto it, and the tear then abandoned it there.
+            let candidate = panel.drag_row.borrow().clone();
+            if let Some(kind) = candidate {
+                if !geom::tear_committed(dx, dy) {
+                    return;
                 }
+                if let Some(new_panel) = tear_off(&panel, &kind, dx, dy) {
+                    *panel.drag_target.borrow_mut() = Some(new_panel);
+                    *panel.drag_row.borrow_mut() = None;
+                    return;
+                }
+                // The tear could not happen at all. Stop treating this as a
+                // candidate so the gesture degrades to a plain move rather than
+                // freezing the panel for the rest of the drag.
+                *panel.drag_row.borrow_mut() = None;
             }
 
             panel.apply_move(dx, dy);
@@ -769,6 +863,11 @@ fn wire_drag(panel: &Rc<Panel>) {
         drag.connect_drag_end(move |_, _, _| {
             let zone = panel.drag_zone.get();
             panel.drag_zone.set(Zone::None);
+
+            // Still set means this gesture began on a row and never cleared the
+            // tear threshold. Nothing moved, so nothing settles: snapping or
+            // merging here would displace a panel the user never dragged.
+            let uncommitted = panel.drag_row.borrow().is_some();
             *panel.drag_row.borrow_mut() = None;
 
             // Whoever was actually being moved is who settles.
@@ -780,7 +879,7 @@ fn wire_drag(panel: &Rc<Panel>) {
                 (panel.content.set_resizing)(false);
                 return;
             }
-            if panel.pinned.get() || !panel.layered {
+            if uncommitted || panel.pinned.get() || !panel.layered {
                 return;
             }
 
@@ -826,8 +925,17 @@ fn tear_off(panel: &Rc<Panel>, kind: &str, dx: f64, dy: f64) -> Option<Rc<Panel>
 
     let size = panel.panel_size();
 
+    // Four points across the tear, so the source panel's geometry can be
+    // followed through the synchronous row removal and the two asynchronous
+    // events that follow it.
+    panel.debug_source("tear-source-before", "about to remove the row");
+
     // The source loses the row, and materialises its wildcard in the process.
     panel.content.remove_kind(kind);
+
+    panel.debug_source("tear-source-after", "row removed and re-rendered");
+    panel.trace_next_alloc.set(true);
+    panel.trace_next_request.set(true);
 
     let new_panel = Panel::new(&layout, vec![kind.to_string()], placed, size);
     new_panel.monitor.set(panel.monitor.get());

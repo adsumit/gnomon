@@ -160,6 +160,21 @@ pub const TEAR_THRESHOLD: f64 = 40.0;
 /// Two panels closer than this at drag-end merge.
 pub const MERGE_THRESHOLD: i32 = 60;
 
+/// Has a drag that started on a tear-candidate row committed to the tear?
+///
+/// Below the threshold the gesture is still ambiguous — it could become either
+/// a tear or a plain move — and an ambiguous gesture must move NOTHING. Moving
+/// the source panel first and tearing afterwards leaves the source displaced by
+/// however far the pointer travelled before the threshold was crossed, and
+/// nothing ever puts it back.
+///
+/// The test is radial, not per-axis: a drag is a distance from the press point,
+/// so 30 across and 40 down is 50 of movement and reads as deliberate even
+/// though neither component reaches the threshold on its own.
+pub fn tear_committed(dx: f64, dy: f64) -> bool {
+    dx.hypot(dy) > TEAR_THRESHOLD
+}
+
 /// A panel's rectangle in monitor space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
@@ -777,6 +792,54 @@ mod tests {
             Rect::new(Margins { left: 12, top: 34 }, (300, 150)),
             rect(12, 34, 300, 150)
         );
+    }
+
+    // ---- tear commitment ----
+    //
+    // These pin down the window in which the source panel must not move. Every
+    // offset that answers `false` here is an offset at which the source panel's
+    // margins must still equal its drag-begin margins.
+
+    #[test]
+    fn a_stationary_drag_never_tears() {
+        assert!(!tear_committed(0.0, 0.0));
+    }
+
+    #[test]
+    fn tear_needs_strictly_more_than_the_threshold() {
+        assert!(!tear_committed(39.9, 0.0));
+        assert!(
+            !tear_committed(TEAR_THRESHOLD, 0.0),
+            "40 exactly is not past 40"
+        );
+        assert!(tear_committed(40.1, 0.0));
+    }
+
+    #[test]
+    fn tear_is_radial_not_per_axis() {
+        // 30 across and 40 down is 50 of travel, so it commits even though
+        // neither component reaches 40 on its own.
+        assert!(tear_committed(30.0, 40.0));
+        // Whereas 30 and 25 is only ~39, and does not.
+        assert!(!tear_committed(30.0, 25.0));
+    }
+
+    #[test]
+    fn tear_ignores_direction() {
+        for (dx, dy) in [(41.0, 0.0), (-41.0, 0.0), (0.0, 41.0), (0.0, -41.0)] {
+            assert!(tear_committed(dx, dy), "({dx},{dy}) should tear");
+        }
+    }
+
+    #[test]
+    fn the_undecided_band_is_the_whole_disc_of_the_threshold() {
+        // Sampled around the circle: nothing inside the radius may commit,
+        // because inside it the source panel is required to stay put.
+        for step in 0..16 {
+            let angle = std::f64::consts::TAU * f64::from(step) / 16.0;
+            let (dx, dy) = (angle.cos() * 39.0, angle.sin() * 39.0);
+            assert!(!tear_committed(dx, dy), "({dx:.1},{dy:.1}) is inside 40");
+        }
     }
 
     // ---- zone classification ----
