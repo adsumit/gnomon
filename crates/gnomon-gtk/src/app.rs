@@ -412,21 +412,31 @@ impl Panel {
             return;
         }
 
-        let natural = self.content.natural_size();
+        // The CACHED natural size, which `remeasure_natural` guarantees was
+        // taken with compact and tight off. Measuring live here would read the
+        // tightened size whenever compact happened to be on, and the fit would
+        // then chase its own tail downward.
+        let Some(natural) = self.content.natural_cached() else {
+            return;
+        };
         if natural.0 <= 0 || natural.1 <= 0 {
             return;
         }
 
-        // Clamped to the SAME floor an interactive resize enforces. Unclamped,
-        // a default panel measures around 168x78 — under both minimums — which
-        // parks it permanently below the responsive thresholds so compact and
-        // tight latch on and the countdowns disappear from every panel the user
-        // has never resized. It also means the first pixel of a later resize
-        // drag jumps the panel back up to the floor, and moves it on a Left or
-        // Top edge. One floor, enforced everywhere.
+        // NO MINIMUM. `MIN_WIDTH`/`MIN_HEIGHT` exist to stop the USER dragging a
+        // panel down to uselessness; an automatic fit is content-sized by
+        // definition, so raising it to a floor taller than the content is how
+        // dead space got manufactured in the first place — 184x144 became
+        // 200x144, 200 fell under the old compact threshold, the padding halved
+        // and the countdowns went, and the panel ended up 200x100 wrapping 78px
+        // of content. The floor still applies to every interactive resize.
+        //
+        // The monitor size IS still a ceiling: a panel larger than the output
+        // cannot be positioned sensibly and could not be dragged back.
+        let monitor = self.monitor.get();
         let fitted = (
-            natural.0.max(geom::MIN_WIDTH),
-            natural.1.max(geom::MIN_HEIGHT),
+            if monitor.0 > 0 { natural.0.min(monitor.0) } else { natural.0 },
+            if monitor.1 > 0 { natural.1.min(monitor.1) } else { natural.1 },
         );
 
         self.resize_phase.set("fit");
@@ -566,7 +576,7 @@ sum={}x{} fitted={}x{}{}",
             fitted.0,
             fitted.1,
             if fitted != (cw + chrome_w, ch + chrome_h) {
-                "  <-- raised by the 200x100 minimum"
+                "  <-- capped by the monitor"
             } else {
                 ""
             },

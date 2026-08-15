@@ -42,6 +42,12 @@ struct State {
     rows: Vec<Row>,
     loaded: bool,
     compact: bool,
+    tight: bool,
+    /// Surface size this content needs with BOTH responsive modes OFF.
+    ///
+    /// The yardstick every responsive decision is measured against. `None`
+    /// until the first `remeasure_natural`.
+    natural: Option<(i32, i32)>,
 }
 
 /// The pieces app.rs needs to wire up interaction.
@@ -379,9 +385,48 @@ suppressed by design, so it must carry hexpand and vexpand to receive any."
         self.status.set_visible(true);
     }
 
+    /// Re-render and refresh the natural-size yardstick.
+    ///
+    /// Every path that changes the ROW SET goes through here, and only through
+    /// here — a kind change, a merge, a new snapshot. The responsive re-render
+    /// in `watch_width` deliberately does NOT, because that one is a
+    /// consequence of the size rather than a change of content.
     fn rerender(&self) {
-        render(&self.content, &self.status, &self.state);
+        self.remeasure_natural();
         self.verify_tree("re-render");
+    }
+
+    /// Cache the size the content wants with compact and tight OFF.
+    ///
+    /// HOW THE LOOP IS PREVENTED, structurally rather than by convention. A
+    /// measurement taken while compact was active would record the tightened
+    /// size — smaller padding, no countdowns — and every later comparison would
+    /// be against that shrunken yardstick, which is precisely the feedback the
+    /// absolute thresholds used to produce. So this function does not trust the
+    /// current state: it CLEARS both latches, applies the un-tightened styling,
+    /// re-renders, and only then measures. `natural` is written here and
+    /// nowhere else, so there is no path to a measurement that skipped those
+    /// steps.
+    ///
+    /// It is called only when the row set changes, never from the responsive
+    /// path and never during a resize, so a compact panel keeps the yardstick
+    /// it was measured against.
+    fn remeasure_natural(&self) {
+        {
+            let mut s = self.state.borrow_mut();
+            s.compact = false;
+            s.tight = false;
+        }
+        apply_tight(&self.shell, &self.content, false);
+        render(&self.content, &self.status, &self.state);
+
+        let measured = self.natural_size();
+        self.state.borrow_mut().natural = Some(measured);
+    }
+
+    /// The cached natural size, if one has been measured.
+    pub fn natural_cached(&self) -> Option<(i32, i32)> {
+        self.state.borrow().natural
     }
 }
 
@@ -437,6 +482,8 @@ pub fn build(kinds: Vec<String>) -> Content {
         rows: Vec::new(),
         loaded: false,
         compact: false,
+        tight: false,
+        natural: None,
     }));
 
     // The ScrolledWindow is what decouples the surface size from the content's
@@ -478,7 +525,6 @@ pub fn build(kinds: Vec<String>) -> Content {
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&shell));
 
-    render(&content, &status, &state);
     debug_css_on_realize(&shell);
     let (probe, set_resizing) = watch_width(&overlay, &shell, &content, &status, &state);
 
@@ -503,6 +549,9 @@ pub fn build(kinds: Vec<String>) -> Content {
         status,
         state,
     };
+    // Seeds `natural` as well as drawing the placeholder, so the responsive
+    // path has a yardstick from the very first allocation.
+    built.remeasure_natural();
     built.verify_tree("construction");
     built
 }
@@ -529,10 +578,9 @@ fn watch_width(
         .can_target(false)
         .build();
 
-    let last_compact = Rc::new(Cell::new(false));
-    let last_tight = Rc::new(Cell::new(false));
     // Compact state the allocation implies, which may not be on screen yet
-    // because a resize is in progress.
+    // because a resize is in progress. The LATCHES themselves live in `state`,
+    // so `remeasure_natural` can clear them before taking a measurement.
     let wanted_compact = Rc::new(Cell::new(false));
     let resizing = Rc::new(Cell::new(false));
 
@@ -541,26 +589,43 @@ fn watch_width(
         let content_c = content.clone();
         let status_c = status.clone();
         let state_c = state.clone();
-        let last_compact = last_compact.clone();
-        let last_tight = last_tight.clone();
         let wanted_compact = wanted_compact.clone();
         let resizing = resizing.clone();
 
         probe.connect_resize(move |_, width, height| {
-            let (compact, tight) =
-                geom::responsive_state(width, height, last_compact.get(), last_tight.get());
+            let (natural, was_compact, was_tight) = {
+                let s = state_c.borrow();
+                (s.natural, s.compact, s.tight)
+            };
+
+            // No yardstick yet: nothing has been rendered, so there is no
+            // content whose size could justify tightening anything.
+            let Some(natural) = natural else {
+                return;
+            };
+
+            let (compact, tight) = geom::responsive_state(
+                (width, height),
+                natural,
+                geom::RESPONSIVE_BAND,
+                was_compact,
+                was_tight,
+            );
 
             // Restyling is cheap, so it stays live during a drag.
-            if tight != last_tight.get() {
-                last_tight.set(tight);
+            if tight != was_tight {
+                state_c.borrow_mut().tight = tight;
                 apply_tight(&shell_c, &content_c, tight);
             }
 
             // Rebuilding every widget is not cheap. Mid-drag it is the most
             // visible cost per frame, so it waits for the drag to end.
+            //
+            // NOTE: `render`, never `remeasure_natural`. This re-render is a
+            // consequence of the size, not a change of content, so it must not
+            // move the yardstick it was just measured against.
             wanted_compact.set(compact);
-            if !resizing.get() && compact != last_compact.get() {
-                last_compact.set(compact);
+            if !resizing.get() && compact != was_compact {
                 state_c.borrow_mut().compact = compact;
                 render(&content_c, &status_c, &state_c);
             }
@@ -583,8 +648,7 @@ fn watch_width(
             }
             // Drag over: settle whatever the last allocation implied.
             let compact = wanted_compact.get();
-            if compact != last_compact.get() {
-                last_compact.set(compact);
+            if compact != state_c.borrow().compact {
                 state_c.borrow_mut().compact = compact;
                 render(&content_c, &status_c, &state_c);
             }

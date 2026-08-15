@@ -87,42 +87,55 @@ pub fn snap_margins(left: i32, top: i32, panel: (i32, i32), monitor: (i32, i32))
     }
 }
 
-// Responsive thresholds. Enter and exit differ so a drag hovering near a
-// boundary cannot oscillate: crossing in and crossing back out need different
-// widths, and the gap between them is a dead band where nothing changes.
-pub const COMPACT_ENTER_W: i32 = 240;
-pub const COMPACT_EXIT_W: i32 = 252;
-pub const TIGHT_ENTER_W: i32 = 200;
-pub const TIGHT_EXIT_W: i32 = 212;
-pub const TIGHT_ENTER_H: i32 = 150;
-pub const TIGHT_EXIT_H: i32 = 162;
-
-/// Decide the responsive flags from an allocation, with hysteresis.
+/// Hysteresis band around the natural size, in pixels.
 ///
-/// Pure, so the oscillation behaviour is testable without a display. Returns
-/// `(compact, tight)`; an unallocated size leaves both unchanged.
+/// Entering and leaving a responsive mode use different comparisons, and this is
+/// the gap between them: a drag hovering right at the boundary cannot oscillate
+/// because crossing back out needs this much more room than crossing in did.
+pub const RESPONSIVE_BAND: i32 = 12;
+
+/// Decide the responsive flags by comparing the allocation to the CONTENT.
+///
+/// The thresholds used to be absolute constants — compact below 240px wide —
+/// which was wrong in a way that only showed up once panels were sized to fit:
+/// a two-row panel's natural width is about 184px, permanently under 240, so a
+/// correctly-sized panel was always compact. Worse, compact halves the padding
+/// and drops the countdowns, which shrinks the content, which shrinks the fit,
+/// which drives it further under the constant. The panel could never be both
+/// correctly sized and un-tightened.
+///
+/// Measuring against the panel's own natural size removes the loop by
+/// construction: a panel allocated exactly what its content needs is, by
+/// definition, not short of room. `natural` must be the size the content wants
+/// with BOTH modes off — see `Content::remeasure_natural`, which is the only
+/// writer and clears the latches before it measures.
+///
+/// Pure, so the behaviour is testable without a display. An unallocated size
+/// leaves both latches unchanged.
 pub fn responsive_state(
-    width: i32,
-    height: i32,
+    allocated: (i32, i32),
+    natural: (i32, i32),
+    band: i32,
     compact: bool,
     tight: bool,
 ) -> (bool, bool) {
-    if width <= 0 || height <= 0 {
+    if allocated.0 <= 0 || allocated.1 <= 0 {
         return (compact, tight);
     }
 
     let compact = if compact {
-        // Stay compact until comfortably clear of the entry threshold.
-        width <= COMPACT_EXIT_W
+        // Stay compact until there is genuinely room to spare.
+        allocated.0 <= natural.0 + band
     } else {
-        width < COMPACT_ENTER_W
+        allocated.0 < natural.0
     };
 
+    // Height only. Tight is about vertical crowding, and coupling it to width
+    // made a narrow-but-tall panel tighten for no reason.
     let tight = if tight {
-        // Both axes must clear their exit thresholds to leave tight mode.
-        !(width > TIGHT_EXIT_W && height > TIGHT_EXIT_H)
+        allocated.1 <= natural.1 + band
     } else {
-        width < TIGHT_ENTER_W || height < TIGHT_ENTER_H
+        allocated.1 < natural.1
     };
 
     (compact, tight)
@@ -521,66 +534,113 @@ mod tests {
 
     // ---- size ----
 
-    // ---- responsive hysteresis ----
+    // ---- responsive hysteresis, measured against natural size ----
+    //
+    // The yardstick is the panel's own content, not a constant. NATURAL is the
+    // real two-row measurement from a debug run: 184x144.
+
+    const NATURAL: (i32, i32) = (184, 144);
+    const BAND: i32 = RESPONSIVE_BAND;
 
     #[test]
-    fn compact_enters_below_the_entry_threshold() {
-        assert!(responsive_state(239, 400, false, false).0);
+    fn a_panel_given_exactly_its_natural_size_is_not_compact() {
+        // The defect this replaced: 184 is under the old 240 constant, so a
+        // correctly-sized panel was permanently compact.
+        let (compact, tight) = responsive_state(NATURAL, NATURAL, BAND, false, false);
+        assert!(!compact, "not short of width");
+        assert!(!tight, "not short of height");
+    }
+
+    #[test]
+    fn compact_enters_below_the_natural_width() {
+        assert!(responsive_state((183, 400), NATURAL, BAND, false, false).0);
         assert!(
-            !responsive_state(240, 400, false, false).0,
-            "the entry threshold itself is not below it"
+            !responsive_state((184, 400), NATURAL, BAND, false, false).0,
+            "natural width itself is not below natural width"
         );
     }
 
     #[test]
-    fn compact_leaves_only_above_the_exit_threshold() {
-        // Already compact: 245 is past the entry threshold but inside the dead
-        // band, so it must stay compact.
-        assert!(responsive_state(245, 400, true, false).0);
-        assert!(responsive_state(252, 400, true, false).0);
-        assert!(!responsive_state(253, 400, true, false).0);
+    fn compact_leaves_only_past_the_band() {
+        // Already compact: past natural but inside the band, so it stays.
+        assert!(responsive_state((190, 400), NATURAL, BAND, true, false).0);
+        assert!(responsive_state((196, 400), NATURAL, BAND, true, false).0);
+        assert!(!responsive_state((197, 400), NATURAL, BAND, true, false).0);
     }
 
     #[test]
     fn compact_dead_band_holds_both_states() {
         // The same width yields a different answer depending on where it came
         // from — that is the whole point of hysteresis.
-        for width in [241, 246, 252] {
-            assert!(responsive_state(width, 400, true, false).0);
-            assert!(!responsive_state(width, 400, false, false).0);
+        for width in [185, 190, 196] {
+            assert!(responsive_state((width, 400), NATURAL, BAND, true, false).0);
+            assert!(!responsive_state((width, 400), NATURAL, BAND, false, false).0);
         }
     }
 
     #[test]
-    fn tight_enters_on_either_axis() {
-        assert!(responsive_state(199, 400, false, false).1);
-        assert!(responsive_state(400, 149, false, false).1);
-        assert!(!responsive_state(400, 400, false, false).1);
+    fn tight_enters_below_the_natural_height() {
+        assert!(responsive_state((400, 143), NATURAL, BAND, false, false).1);
+        assert!(!responsive_state((400, 144), NATURAL, BAND, false, false).1);
     }
 
     #[test]
-    fn tight_leaves_only_when_both_axes_clear() {
-        // Width clear, height still inside: stays tight.
-        assert!(responsive_state(300, 155, false, true).1);
-        // Height clear, width still inside: stays tight.
-        assert!(responsive_state(205, 300, false, true).1);
-        // Both clear: leaves.
-        assert!(!responsive_state(213, 163, false, true).1);
+    fn tight_leaves_only_past_the_band() {
+        assert!(responsive_state((400, 150), NATURAL, BAND, false, true).1);
+        assert!(responsive_state((400, 156), NATURAL, BAND, false, true).1);
+        assert!(!responsive_state((400, 157), NATURAL, BAND, false, true).1);
     }
 
     #[test]
     fn tight_dead_band_holds_both_states() {
-        for (w, h) in [(205, 155), (212, 162)] {
-            assert!(responsive_state(w, h, false, true).1);
-            assert!(!responsive_state(w, h, false, false).1);
+        for height in [145, 150, 156] {
+            assert!(responsive_state((400, height), NATURAL, BAND, false, true).1);
+            assert!(!responsive_state((400, height), NATURAL, BAND, false, false).1);
         }
     }
 
     #[test]
+    fn tight_is_decided_by_height_alone() {
+        // A narrow but tall panel tightens on width under the old rule. It
+        // must not: tight is about vertical crowding.
+        assert!(!responsive_state((60, 400), NATURAL, BAND, false, false).1);
+        // And a wide but short one still tightens.
+        assert!(responsive_state((900, 100), NATURAL, BAND, false, false).1);
+    }
+
+    #[test]
+    fn the_two_axes_are_independent() {
+        // Short of width only: compact, not tight.
+        assert_eq!(
+            responsive_state((100, 400), NATURAL, BAND, false, false),
+            (true, false)
+        );
+        // Short of height only: tight, not compact.
+        assert_eq!(
+            responsive_state((400, 100), NATURAL, BAND, false, false),
+            (false, true)
+        );
+        // Short of both.
+        assert_eq!(
+            responsive_state((100, 100), NATURAL, BAND, false, false),
+            (true, true)
+        );
+    }
+
+    #[test]
     fn unallocated_size_changes_nothing() {
-        assert_eq!(responsive_state(0, 0, true, true), (true, true));
-        assert_eq!(responsive_state(0, 0, false, false), (false, false));
-        assert_eq!(responsive_state(300, 0, false, false), (false, false));
+        assert_eq!(
+            responsive_state((0, 0), NATURAL, BAND, true, true),
+            (true, true)
+        );
+        assert_eq!(
+            responsive_state((0, 0), NATURAL, BAND, false, false),
+            (false, false)
+        );
+        assert_eq!(
+            responsive_state((300, 0), NATURAL, BAND, false, false),
+            (false, false)
+        );
     }
 
     // ---- drag offsets must not accumulate ----
