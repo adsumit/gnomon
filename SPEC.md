@@ -70,10 +70,15 @@ Render one bar per entry in `limits[]`. Never hardcode a bar count.
   region, so every click reaches whatever is beneath it.
 - Panels are independent layer surfaces. Each owns its own position, size and pin state;
   none of the three is shared.
-- Dragging a row more than 40px tears it into a panel of its own. The drag continues,
-  driving the new panel.
+- Dragging a row moves the panel while the pointer stays over it, and tears the row into a
+  panel of its own once the pointer leaves the rectangle the panel occupied when the drag
+  began. The rectangle is closed: a pointer exactly on an edge does not tear. The drag
+  continues, driving the new panel; the source keeps the position the in-panel part of the
+  drag gave it.
 - On release, a panel within 60px of another merges into it. The stationary panel absorbs
-  the kinds and keeps its own position, size and pin state.
+  the kinds and keeps its own position, size and pin state. If the merged kind list then
+  covers every kind in the snapshot, it reverts to the wildcard, so the panel keeps
+  picking up kinds the API adds later.
 - The pin toggle is delivered by SIGUSR1, because a click-through surface cannot be
   clicked to un-pin itself. SIGUSR1 applies to ALL panels at once: if any is pinned it
   unpins every panel, otherwise it pins every panel. A click-through panel is therefore

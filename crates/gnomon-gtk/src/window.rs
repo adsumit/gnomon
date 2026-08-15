@@ -68,6 +68,29 @@ fn visible(kinds: &[String], all: &[LimitWindow]) -> Vec<LimitWindow> {
         .collect()
 }
 
+/// Does this kind list already account for every kind the snapshot reports?
+///
+/// The wildcard (an empty list) is a cover by definition: it renders everything,
+/// including kinds that do not exist yet. An explicit list covers the snapshot
+/// when every kind in the snapshot appears in it. Extra entries do not spoil a
+/// cover — a kind the API has stopped reporting does not make a panel any less
+/// complete — so a superset counts.
+///
+/// An empty snapshot is deliberately NOT a cover for an explicit list. "Every
+/// kind in nothing appears in the list" is vacuously true, and promoting a
+/// panel to the wildcard on that basis would be a decision made from no
+/// evidence at all.
+fn covers_every_kind(kinds: &[String], all: &[LimitWindow]) -> bool {
+    if kinds.is_empty() {
+        return true;
+    }
+    if all.is_empty() {
+        return false;
+    }
+    all.iter()
+        .all(|w| kinds.iter().any(|k| k == &w.kind))
+}
+
 /// Does a freshly filtered set replace what is on screen?
 ///
 /// Three cases, and the first is the one a torn-off panel depends on. A panel
@@ -140,6 +163,28 @@ impl Content {
         self.set_kinds(kinds);
     }
 
+    /// Collapse a complete explicit kind list back to the wildcard.
+    ///
+    /// A tear followed by a merge would otherwise cost a panel its wildcard
+    /// status permanently: `remove_kind` materialises the wildcard into an
+    /// explicit list, and `absorb` unions two explicit lists, so the panel would
+    /// never again pick up a kind the API starts reporting later. Once the list
+    /// covers everything again, the explicit form carries no more information
+    /// than the wildcard did — so it goes back to being the wildcard.
+    ///
+    /// Returns whether it restored, which is what the debug trace reports.
+    pub fn restore_wildcard_if_complete(&self, all: &[LimitWindow]) -> bool {
+        let restore = {
+            let s = self.state.borrow();
+            !s.kinds.is_empty() && covers_every_kind(&s.kinds, all)
+        };
+
+        if restore {
+            self.set_kinds(Vec::new());
+        }
+        restore
+    }
+
     /// Which row's kind sits at this overlay-local y, if any.
     pub fn kind_at(&self, y: f64) -> Option<String> {
         let state = self.state.borrow();
@@ -172,11 +217,17 @@ impl Content {
     pub fn apply_snapshot(&self, snapshot: &UsageSnapshot) {
         let changed = {
             let mut s = self.state.borrow_mut();
-            s.all = snapshot.windows.clone();
-
-            let next = visible(&s.kinds, &s.all);
+            let next = visible(&s.kinds, &snapshot.windows);
 
             if takes_snapshot(s.loaded, &s.windows, &next) {
+                // `all` and `windows` are written together and never apart. A
+                // rejected snapshot must not be stored either: `all` would then
+                // describe one poll while `windows` describes an older one, and
+                // the next kind-list edit — which re-filters from `all` — would
+                // blank the panel to rows the user never asked to lose. Keeping
+                // the last snapshot that actually mentioned these kinds is the
+                // whole point of rejecting the new one.
+                s.all = snapshot.windows.clone();
                 s.windows = next;
                 s.loaded = true;
                 true
@@ -608,6 +659,53 @@ mod tests {
     fn a_kind_absent_from_the_snapshot_yields_nothing() {
         let kinds = vec!["not_a_real_kind".to_string()];
         assert!(visible(&kinds, &all()).is_empty());
+    }
+
+    // ---- wildcard restoration ----
+    //
+    // A tear materialises the wildcard into an explicit list. These decide when
+    // a later merge is allowed to turn it back into the wildcard, which is what
+    // keeps the panel picking up kinds the API adds in future.
+
+    fn kinds(names: &[&str]) -> Vec<String> {
+        names.iter().map(|k| k.to_string()).collect()
+    }
+
+    #[test]
+    fn an_exact_cover_restores_the_wildcard() {
+        assert!(covers_every_kind(&kinds(&["five_hour", "seven_day"]), &all()));
+    }
+
+    #[test]
+    fn cover_ignores_the_order_of_the_kind_list() {
+        assert!(covers_every_kind(&kinds(&["seven_day", "five_hour"]), &all()));
+    }
+
+    #[test]
+    fn a_superset_still_covers() {
+        // A kind the API has stopped reporting does not make the panel any less
+        // complete, so the extra entry is harmless.
+        let list = kinds(&["five_hour", "seven_day", "retired_kind"]);
+        assert!(covers_every_kind(&list, &all()));
+    }
+
+    #[test]
+    fn missing_one_kind_is_not_a_cover() {
+        assert!(!covers_every_kind(&kinds(&["five_hour"]), &all()));
+    }
+
+    #[test]
+    fn an_empty_snapshot_does_not_promote_an_explicit_list() {
+        // Vacuously "covers everything", but on no evidence at all — so it must
+        // not be treated as a cover.
+        assert!(!covers_every_kind(&kinds(&["five_hour"]), &[]));
+    }
+
+    #[test]
+    fn a_wildcard_is_already_a_cover() {
+        assert!(covers_every_kind(&[], &all()));
+        // Including against an empty snapshot: it renders whatever arrives.
+        assert!(covers_every_kind(&[], &[]));
     }
 
     // ---- the seeding decision ----

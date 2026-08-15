@@ -42,7 +42,9 @@ pub struct Panel {
     margins: Cell<Margins>,
     /// Margins at the moment a drag began.
     drag_origin: Cell<Margins>,
-    /// Window size at the moment a resize drag began.
+    /// Window size at the moment a drag began — any drag, not just a resize.
+    /// A resize measures from it, and the tear test uses it as the second half
+    /// of the frozen rectangle the pointer has to leave.
     resize_origin: Cell<(i32, i32)>,
     /// Mode chosen at drag-begin. Never changes mid-drag.
     drag_zone: Cell<Zone>,
@@ -204,6 +206,17 @@ impl Panel {
 
     pub fn rect(&self) -> geom::Rect {
         geom::Rect::new(self.margins.get(), self.panel_size())
+    }
+
+    /// The rectangle this panel occupied when the current drag began.
+    ///
+    /// The tear test measures against this, never against `rect()`. A move
+    /// drags the panel with the pointer one-for-one, so in the LIVE rectangle
+    /// the pointer never moves relative to the panel at all and could never
+    /// leave it. Frozen at the press, the footprint stays still while the
+    /// pointer travels, so leaving it means something.
+    fn drag_origin_rect(&self) -> geom::Rect {
+        geom::Rect::new(self.drag_origin.get(), self.resize_origin.get())
     }
 
     fn panel_size(&self) -> (i32, i32) {
@@ -650,11 +663,24 @@ impl Layout {
         // would silently wipe an error banner the survivor is displaying.
         into.content.absorb(dragged.content.kinds());
 
+        // Reading the cache here is safe in a way that re-applying it is not:
+        // this path goes through `set_kinds`, which re-renders without touching
+        // the status label, so an error banner on the survivor survives.
+        let restored = match self.last_snapshot.borrow().as_ref() {
+            Some(snapshot) => into.content.restore_wildcard_if_complete(&snapshot.windows),
+            None => false,
+        };
+
         self.remove(dragged);
 
         if std::env::var_os("GNOMON_DEBUG_GEOM").is_some() {
             eprintln!(
-                "gnomon geom[merge]: absorbed, {} panels remain",
+                "gnomon geom[merge]: absorbed{}, {} panels remain",
+                if restored {
+                    ", wildcard restored"
+                } else {
+                    ""
+                },
                 self.count()
             );
         }
@@ -843,27 +869,25 @@ fn wire_drag(panel: &Rc<Panel>) {
                 return;
             }
 
-            // A press on a tear-candidate row is an ambiguous gesture: it will
-            // become either a tear or a move, and which one is not known until
-            // it clears the threshold. An ambiguous gesture must move NOTHING.
-            //
-            // Moving the source first and tearing afterwards is what left the
-            // source panel displaced: every update below the threshold wrote
-            // new margins onto it, and the tear then abandoned it there.
+            // A drag that began on a row tears only once the pointer LEAVES the
+            // panel. While it is still over the panel the gesture is an ordinary
+            // move and falls through, so the panel tracks the pointer exactly as
+            // a non-row drag does. The source therefore keeps whatever position
+            // the in-panel part of the drag gave it, which is where the user put
+            // it, and stops moving the moment the row tears out.
             let candidate = panel.drag_row.borrow().clone();
             if let Some(kind) = candidate {
-                if !geom::tear_committed(dx, dy) {
-                    return;
-                }
-                if let Some(new_panel) = tear_off(&panel, &kind, dx, dy) {
-                    *panel.drag_target.borrow_mut() = Some(new_panel);
+                let pointer = panel.pointer_in_monitor(dx, dy);
+                if geom::point_outside(panel.drag_origin_rect(), pointer) {
+                    if let Some(new_panel) = tear_off(&panel, &kind, dx, dy) {
+                        *panel.drag_target.borrow_mut() = Some(new_panel);
+                        *panel.drag_row.borrow_mut() = None;
+                        return;
+                    }
+                    // The tear could not happen at all. Stop testing for it so
+                    // the rest of the gesture is a plain move.
                     *panel.drag_row.borrow_mut() = None;
-                    return;
                 }
-                // The tear could not happen at all. Stop treating this as a
-                // candidate so the gesture degrades to a plain move rather than
-                // freezing the panel for the rest of the drag.
-                *panel.drag_row.borrow_mut() = None;
             }
 
             panel.apply_move(dx, dy);
@@ -872,47 +896,70 @@ fn wire_drag(panel: &Rc<Panel>) {
 
     {
         let panel = panel.clone();
-        drag.connect_drag_end(move |_, _, _| {
+        drag.connect_drag_end(move |_, dx, dy| {
             let zone = panel.drag_zone.get();
             panel.drag_zone.set(Zone::None);
 
-            // Still set means this gesture began on a row and never cleared the
-            // tear threshold. Nothing moved, so nothing settles: snapping or
-            // merging here would displace a panel the user never dragged.
-            let uncommitted = panel.drag_row.borrow().is_some();
             *panel.drag_row.borrow_mut() = None;
 
             // Whoever was actually being moved is who settles.
             let torn = panel.drag_target.borrow().clone();
             *panel.drag_target.borrow_mut() = None;
-            let moved = torn.unwrap_or_else(|| panel.clone());
+            let moved = torn.clone().unwrap_or_else(|| panel.clone());
 
             if zone.is_resize() {
                 (panel.content.set_resizing)(false);
                 return;
             }
-            if uncommitted || panel.pinned.get() || !panel.layered {
+            if panel.pinned.get() || !panel.layered {
+                return;
+            }
+
+            // A press with no movement is a click, and a click settles nothing.
+            // GestureDrag reports begin-then-end for a bare click, so without
+            // this a click on a panel resting near another would merge the two
+            // and destroy a window the user never dragged.
+            if torn.is_none() && dx as i32 == 0 && dy as i32 == 0 {
                 return;
             }
 
             // Merge takes priority: snapping a panel that is about to be
             // absorbed would just be wasted motion.
-            if let Some(layout) = moved.layout.upgrade() {
-                if let Some(into) = layout.merge_target(&moved) {
-                    layout.merge(&moved, &into);
-                    return;
-                }
+            let merged = match moved.layout.upgrade() {
+                Some(layout) => match layout.merge_target(&moved) {
+                    Some(into) => {
+                        layout.merge(&moved, &into);
+                        true
+                    }
+                    None => false,
+                },
+                None => false,
+            };
+
+            if !merged {
+                snap_into_place(&moved);
             }
 
-            let m = moved.margins.get();
-            let snapped =
-                geom::snap_margins(m.left, m.top, moved.panel_size(), moved.monitor.get());
-            moved.margins.set(snapped);
-            moved.apply_margins("snap", moved.panel_size(), "allocated");
+            // A tear leaves the SOURCE wherever the in-panel part of the drag
+            // put it, which can be hard against a monitor edge. It snaps like
+            // the end of any other move — but it is never merged: the gesture
+            // was a tear, and silently absorbing the panel the user tore FROM
+            // would be the opposite of what they asked for.
+            if !Rc::ptr_eq(&moved, &panel) {
+                snap_into_place(&panel);
+            }
         });
     }
 
     panel.content.overlay.add_controller(drag);
+}
+
+/// End-of-move settle: pull the panel to a monitor edge if it is close enough.
+fn snap_into_place(panel: &Rc<Panel>) {
+    let m = panel.margins.get();
+    let snapped = geom::snap_margins(m.left, m.top, panel.panel_size(), panel.monitor.get());
+    panel.margins.set(snapped);
+    panel.apply_margins("snap", panel.panel_size(), "allocated");
 }
 
 /// Detach one row into a panel of its own.

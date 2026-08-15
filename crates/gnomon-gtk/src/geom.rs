@@ -155,25 +155,8 @@ pub fn drag_point(origin: Margins, grab: (i32, i32), dx: i32, dy: i32) -> (i32, 
     (origin.left + grab.0 + dx, origin.top + grab.1 + dy)
 }
 
-/// A drag on a row must exceed this before it tears the row into its own panel.
-pub const TEAR_THRESHOLD: f64 = 40.0;
 /// Two panels closer than this at drag-end merge.
 pub const MERGE_THRESHOLD: i32 = 60;
-
-/// Has a drag that started on a tear-candidate row committed to the tear?
-///
-/// Below the threshold the gesture is still ambiguous — it could become either
-/// a tear or a plain move — and an ambiguous gesture must move NOTHING. Moving
-/// the source panel first and tearing afterwards leaves the source displaced by
-/// however far the pointer travelled before the threshold was crossed, and
-/// nothing ever puts it back.
-///
-/// The test is radial, not per-axis: a drag is a distance from the press point,
-/// so 30 across and 40 down is 50 of movement and reads as deliberate even
-/// though neither component reaches the threshold on its own.
-pub fn tear_committed(dx: f64, dy: f64) -> bool {
-    dx.hypot(dy) > TEAR_THRESHOLD
-}
 
 /// A panel's rectangle in monitor space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,6 +213,25 @@ pub fn rect_gap(a: Rect, b: Rect) -> i32 {
 /// Are these two rectangles within `threshold` of each other?
 pub fn rects_within(a: Rect, b: Rect, threshold: i32) -> bool {
     rect_gap(a, b) <= threshold
+}
+
+/// Has the pointer left the panel? This is the tear test.
+///
+/// BOUNDARY CONVENTION: the rectangle is CLOSED on all four sides. A pointer
+/// exactly on an edge — `x == left`, `x == left + width`, and the same for the
+/// vertical pair — is inside, and does not tear. Only strictly beyond an edge
+/// tears. The bias is deliberate: an accidental tear is far more disruptive
+/// than a move that has not yet committed, so the ambiguous pixel moves.
+///
+/// The caller must pass the rectangle the panel occupied when the drag BEGAN,
+/// not its live one. During a move the panel tracks the pointer exactly, so the
+/// pointer stays pinned at the same point inside the live rectangle and could
+/// never escape it — the tear would be unreachable. Measured against the
+/// footprint at the press, "the pointer has left the panel" is a question that
+/// can actually be answered yes.
+pub fn point_outside(rect: Rect, point: (i32, i32)) -> bool {
+    let (x, y) = point;
+    x < rect.left || x > rect.left + rect.width || y < rect.top || y > rect.top + rect.height
 }
 
 /// Thickness of the interactive edge and corner resize band.
@@ -794,52 +796,87 @@ mod tests {
         );
     }
 
-    // ---- tear commitment ----
+    // ---- leaving the panel: the tear test ----
     //
-    // These pin down the window in which the source panel must not move. Every
-    // offset that answers `false` here is an offset at which the source panel's
-    // margins must still equal its drag-begin margins.
+    // The rectangle here is the one the panel occupied when the drag BEGAN.
+    // Inside it the drag is a move; strictly outside it, the row tears out.
+
+    /// 300x150 at (100, 100), so its edges are x=100, x=400, y=100, y=250.
+    const TORN: Rect = Rect {
+        left: 100,
+        top: 100,
+        width: 300,
+        height: 150,
+    };
 
     #[test]
-    fn a_stationary_drag_never_tears() {
-        assert!(!tear_committed(0.0, 0.0));
+    fn a_pointer_in_the_middle_is_inside() {
+        assert!(!point_outside(TORN, (250, 175)));
     }
 
     #[test]
-    fn tear_needs_strictly_more_than_the_threshold() {
-        assert!(!tear_committed(39.9, 0.0));
-        assert!(
-            !tear_committed(TEAR_THRESHOLD, 0.0),
-            "40 exactly is not past 40"
-        );
-        assert!(tear_committed(40.1, 0.0));
+    fn a_pointer_past_the_left_edge_tears() {
+        assert!(point_outside(TORN, (99, 175)));
     }
 
     #[test]
-    fn tear_is_radial_not_per_axis() {
-        // 30 across and 40 down is 50 of travel, so it commits even though
-        // neither component reaches 40 on its own.
-        assert!(tear_committed(30.0, 40.0));
-        // Whereas 30 and 25 is only ~39, and does not.
-        assert!(!tear_committed(30.0, 25.0));
+    fn a_pointer_past_the_right_edge_tears() {
+        assert!(point_outside(TORN, (401, 175)));
     }
 
     #[test]
-    fn tear_ignores_direction() {
-        for (dx, dy) in [(41.0, 0.0), (-41.0, 0.0), (0.0, 41.0), (0.0, -41.0)] {
-            assert!(tear_committed(dx, dy), "({dx},{dy}) should tear");
+    fn a_pointer_past_the_top_edge_tears() {
+        assert!(point_outside(TORN, (250, 99)));
+    }
+
+    #[test]
+    fn a_pointer_past_the_bottom_edge_tears() {
+        assert!(point_outside(TORN, (250, 251)));
+    }
+
+    #[test]
+    fn a_pointer_exactly_on_an_edge_does_not_tear() {
+        // The closed-rectangle convention: all four edges belong to the panel,
+        // so the ambiguous pixel moves rather than tears.
+        assert!(!point_outside(TORN, (100, 175)), "on the left edge");
+        assert!(!point_outside(TORN, (400, 175)), "on the right edge");
+        assert!(!point_outside(TORN, (250, 100)), "on the top edge");
+        assert!(!point_outside(TORN, (250, 250)), "on the bottom edge");
+    }
+
+    #[test]
+    fn a_pointer_exactly_on_a_corner_does_not_tear() {
+        for corner in [(100, 100), (400, 100), (100, 250), (400, 250)] {
+            assert!(!point_outside(TORN, corner), "corner {corner:?}");
         }
     }
 
     #[test]
-    fn the_undecided_band_is_the_whole_disc_of_the_threshold() {
-        // Sampled around the circle: nothing inside the radius may commit,
-        // because inside it the source panel is required to stay put.
-        for step in 0..16 {
-            let angle = std::f64::consts::TAU * f64::from(step) / 16.0;
-            let (dx, dy) = (angle.cos() * 39.0, angle.sin() * 39.0);
-            assert!(!tear_committed(dx, dy), "({dx:.1},{dy:.1}) is inside 40");
-        }
+    fn a_pointer_diagonally_past_a_corner_tears() {
+        // Outside on BOTH axes at once, at each of the four corners.
+        assert!(point_outside(TORN, (99, 99)), "beyond the top-left");
+        assert!(point_outside(TORN, (401, 99)), "beyond the top-right");
+        assert!(point_outside(TORN, (99, 251)), "beyond the bottom-left");
+        assert!(point_outside(TORN, (401, 251)), "beyond the bottom-right");
+    }
+
+    #[test]
+    fn leaving_on_one_axis_is_enough() {
+        // Still within the panel's vertical span, but well past its right edge.
+        assert!(point_outside(TORN, (900, 175)));
+        // And the mirror: within the horizontal span, far below it.
+        assert!(point_outside(TORN, (250, 900)));
+    }
+
+    #[test]
+    fn a_zero_size_panel_is_a_single_point() {
+        // Degenerate but reachable: a panel measured before its first
+        // allocation. The press point itself must still count as inside, or the
+        // very first drag update would tear.
+        let dot = rect(500, 300, 0, 0);
+        assert!(!point_outside(dot, (500, 300)));
+        assert!(point_outside(dot, (501, 300)));
+        assert!(point_outside(dot, (500, 301)));
     }
 
     // ---- zone classification ----
