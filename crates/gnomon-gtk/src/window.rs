@@ -17,6 +17,8 @@ const SEVERITY_CLASSES: [&str; 3] = ["sev-normal", "sev-warning", "sev-error"];
 /// Root box spacing, normal and tightened.
 const SPACING: i32 = 14;
 const SPACING_TIGHT: i32 = 6;
+/// CSS name of the painted shell. `render` refuses to clear a box with it.
+const SHELL_NAME: &str = "root";
 
 /// One rendered limit window, kept so the countdown can tick without a rebuild
 /// and so a drag can tell which row it started on.
@@ -129,6 +131,76 @@ impl Content {
     /// sizing the surface to.
     pub fn is_loaded(&self) -> bool {
         self.state.borrow().loaded
+    }
+
+    /// Is `shell -> scrolled -> content` still intact?
+    ///
+    /// Walks upward from `content`, which is the direction that matters: the
+    /// question is not "does the shell still have children" but "is the box the
+    /// rows are being appended to still reachable from the window". Unconditional
+    /// in debug builds; behind `GNOMON_DEBUG_GEOM` in release, because it walks
+    /// the tree on every render.
+    ///
+    /// HONEST LIMIT: this checks ATTACHMENT, not visibility. It would NOT have
+    /// caught the defect it was written for — the tree was fully intact and the
+    /// ScrolledWindow was simply allocated 0x0. [`Self::verify_allocation`] is
+    /// the check that catches that one.
+    pub fn verify_tree(&self, phase: &str) {
+        if !cfg!(debug_assertions) && std::env::var_os("GNOMON_DEBUG_GEOM").is_none() {
+            return;
+        }
+
+        let scrolled: gtk::Widget = self.scrolled.clone().upcast();
+        let shell: gtk::Widget = self.shell.clone().upcast();
+
+        let mut chain = Vec::new();
+        let (mut seen_scrolled, mut seen_shell) = (false, false);
+
+        let mut node = self.content.parent();
+        while let Some(widget) = node {
+            chain.push(widget.type_().name().to_string());
+            seen_scrolled |= widget == scrolled;
+            seen_shell |= widget == shell;
+            node = widget.parent();
+        }
+
+        if !seen_scrolled || !seen_shell {
+            eprintln!(
+                "gnomon: DETACHED WIDGET TREE at {phase} — rows are being appended to a box \
+that is not in the window. content's ancestors: [{}]; reached scrolled={seen_scrolled} \
+shell={seen_shell}",
+                chain.join(" -> "),
+            );
+        }
+    }
+
+    /// Did the scrolling area actually get any space?
+    ///
+    /// This is the check that catches an intact-but-invisible tree. The shell
+    /// paints its background from its own allocation, so a ScrolledWindow
+    /// allocated 0x0 inside a correctly-sized shell renders as an empty
+    /// coloured box with working chrome — which is exactly what a missing
+    /// `vexpand` produces, and exactly what no attachment check can see.
+    pub fn verify_allocation(&self, phase: &str) {
+        if !cfg!(debug_assertions) && std::env::var_os("GNOMON_DEBUG_GEOM").is_none() {
+            return;
+        }
+
+        let (shell_w, shell_h) = (self.shell.width(), self.shell.height());
+        let (inner_w, inner_h) = (self.scrolled.width(), self.scrolled.height());
+
+        // Only meaningful once the shell itself has been given room.
+        if shell_w <= 0 || shell_h <= 0 {
+            return;
+        }
+
+        if inner_w <= 0 || inner_h <= 0 {
+            eprintln!(
+                "gnomon: SCROLLED AREA HAS NO SIZE at {phase} — shell={shell_w}x{shell_h} but \
+scrolled={inner_w}x{inner_h}, so the panel will render as an empty box. Its natural size is \
+suppressed by design, so it must carry hexpand and vexpand to receive any."
+            );
+        }
     }
 
     /// The surface size this panel's content wants, chrome included.
@@ -309,6 +381,7 @@ impl Content {
 
     fn rerender(&self) {
         render(&self.content, &self.status, &self.state);
+        self.verify_tree("re-render");
     }
 }
 
@@ -340,6 +413,9 @@ pub fn build(kinds: Vec<String>) -> Content {
     // Natural content width must not be a floor, or an edge drag cannot shrink
     // the panel below whatever the labels happen to need.
     content.set_size_request(0, -1);
+    // Rows span the viewport's width, so the right-aligned percent labels sit
+    // against the panel's edge rather than against the longest label.
+    content.set_hexpand(true);
 
     // `max_width_chars` bounds the NATURAL width. Without it a wrapping label
     // reports its natural width as the entire message on one unwrapped line, so
@@ -373,6 +449,18 @@ pub fn build(kinds: Vec<String>) -> Content {
         .propagate_natural_height(false)
         // No momentum panning from a touch drag.
         .kinetic_scrolling(false)
+        // MUST expand, and this is not cosmetic. `propagate_natural_*(false)`
+        // above makes this widget's natural size ~0 on purpose — that is how it
+        // stops the content acting as a floor under the surface. A GtkBox
+        // allocates a non-expanding child its NATURAL size, so inside the shell
+        // that would be 0x0 and the rows would be allocated nothing at all,
+        // while the shell's own background and border painted normally: an
+        // empty grey box. Before the shell existed this widget was the
+        // overlay's child, and GtkOverlay hands its main child the whole
+        // allocation regardless of these flags, which is why the omission only
+        // became a defect when the box was introduced.
+        .hexpand(true)
+        .vexpand(true)
         .child(&content)
         .build();
 
@@ -383,7 +471,7 @@ pub fn build(kinds: Vec<String>) -> Content {
     let shell = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .build();
-    shell.set_widget_name("root");
+    shell.set_widget_name(SHELL_NAME);
     shell.set_size_request(0, 0);
     shell.append(&scrolled);
 
@@ -405,7 +493,7 @@ pub fn build(kinds: Vec<String>) -> Content {
         });
     }
 
-    Content {
+    let built = Content {
         overlay,
         probe,
         set_resizing,
@@ -414,7 +502,9 @@ pub fn build(kinds: Vec<String>) -> Content {
         content,
         status,
         state,
-    }
+    };
+    built.verify_tree("construction");
+    built
 }
 
 /// Track the panel's size from its allocation, not from a timer.
@@ -581,8 +671,20 @@ fn debug_css_on_realize(root: &gtk::Box) {
     });
 }
 
-/// Rebuild the children of `root` from the stored state.
+/// Rebuild the children of the CONTENT box from the stored state.
+///
+/// The parameter is the content box and never the shell. Passing the shell here
+/// would remove the ScrolledWindow from the tree on the first render and then
+/// append rows into a box attached to nothing — the failure mode the assertion
+/// below exists to make impossible rather than merely unlikely.
 fn render(content: &gtk::Box, status: &gtk::Label, state: &Rc<RefCell<State>>) {
+    debug_assert_ne!(
+        content.widget_name(),
+        SHELL_NAME,
+        "render() must be given the content box, never the shell: clearing the \
+shell detaches the ScrolledWindow and the rows go nowhere"
+    );
+
     // The probe lives in the overlay, so rebuilding the box's children cannot
     // destroy it.
     while let Some(child) = content.first_child() {

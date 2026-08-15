@@ -510,6 +510,10 @@ impl Panel {
             self.debug_source("tear-source-alloc", &format!("allocated={width}x{height}"));
         }
 
+        // The tree is intact only if the scrolling area got real space. An
+        // allocation is the first moment that question has an answer.
+        self.content.verify_allocation("allocation");
+
         // An allocation is also how the responsive modes change: window.rs
         // connected its own handler to this probe FIRST, so by the time we get
         // here it has already decided compact/tight and re-rendered. Entering
