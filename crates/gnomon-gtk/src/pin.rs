@@ -3,6 +3,7 @@
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use gtk::gdk;
 use gtk::prelude::*;
@@ -105,12 +106,25 @@ pub fn block_sigusr1() {
 /// [`block_sigusr1`] must already have run. This may be called late; only the
 /// mask has to be early.
 pub fn watch_sigusr1(tx: async_channel::Sender<()>) {
+    // Exactly one waiter, however many times this is called. GApplication can
+    // activate more than once, and a second sigwait thread would not double the
+    // toggling — it would halve it, because a signal is dequeued by only ONE
+    // waiter, so the two would take turns and each Layout would toggle on
+    // alternate presses.
+    if WATCHER_TID.load(Ordering::SeqCst) != 0 {
+        return;
+    }
+
     // SAFETY: `sigwait` blocks rather than interrupting, so nothing in the
     // spawned thread runs in a signal-handler context.
     unsafe {
         let set = sigusr1_set();
 
         std::thread::spawn(move || {
+            // Published so the guard can recognise this thread and not report
+            // it. See `verify_sigusr1_blocked` for why it has to.
+            WATCHER_TID.store(libc::gettid(), Ordering::SeqCst);
+
             let mut received: libc::c_int = 0;
             loop {
                 if libc::sigwait(&set, &mut received) == 0 && tx.send_blocking(()).is_err() {
@@ -123,6 +137,9 @@ pub fn watch_sigusr1(tx: async_channel::Sender<()>) {
 
 /// Bit position of SIGUSR1 in the kernel's `SigBlk` bitmask, which is 1-based.
 const SIGUSR1_BIT: u64 = 1 << (libc::SIGUSR1 as u64 - 1);
+
+/// The tid of the `sigwait` thread, or 0 before it starts.
+static WATCHER_TID: AtomicI32 = AtomicI32::new(0);
 
 /// Verify SIGUSR1 is still blocked, and say loudly if it is not.
 ///
@@ -174,8 +191,22 @@ fn unblocked_threads() -> Vec<(String, String)> {
 
     let mut offenders = Vec::new();
 
+    let watcher = WATCHER_TID.load(Ordering::SeqCst);
+
     for entry in entries.flatten() {
         let tid = entry.file_name().to_string_lossy().into_owned();
+
+        // The sigwait thread ALWAYS reports SigBlk without SIGUSR1, and that is
+        // correct behaviour, not a fault: `sigwait` dequeues a signal by
+        // clearing it from the waiting thread's blocked mask for the duration
+        // of the wait, and `/proc` publishes that live mask rather than the
+        // saved one. Reporting the one thread whose whole job is to receive
+        // SIGUSR1 as the thread that will kill the process would make this
+        // guard cry wolf on every single launch, which is worse than no guard.
+        if watcher != 0 && tid.parse::<i32>() == Ok(watcher) {
+            continue;
+        }
+
         let Ok(status) = std::fs::read_to_string(entry.path().join("status")) else {
             continue;
         };

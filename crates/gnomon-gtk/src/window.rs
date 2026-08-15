@@ -290,8 +290,13 @@ pub fn build(kinds: Vec<String>) -> Content {
     // the panel below whatever the labels happen to need.
     root.set_size_request(0, -1);
 
+    // `max_width_chars` bounds the NATURAL width. Without it a wrapping label
+    // reports its natural width as the entire message on one unwrapped line, so
+    // a long error string would drag the whole panel out to several hundred
+    // pixels the moment `fit_to_content` measured it.
     let status = gtk::Label::builder()
         .wrap(true)
+        .max_width_chars(28)
         .xalign(0.0)
         .visible(false)
         .ellipsize(pango::EllipsizeMode::End)

@@ -399,8 +399,33 @@ impl Panel {
             return;
         }
 
+        // Clamped to the SAME floor an interactive resize enforces. Unclamped,
+        // a default panel measures around 168x78 — under both minimums — which
+        // parks it permanently below the responsive thresholds so compact and
+        // tight latch on and the countdowns disappear from every panel the user
+        // has never resized. It also means the first pixel of a later resize
+        // drag jumps the panel back up to the floor, and moves it on a Left or
+        // Top edge. One floor, enforced everywhere.
+        let fitted = (
+            natural.0.max(geom::MIN_WIDTH),
+            natural.1.max(geom::MIN_HEIGHT),
+        );
+
         self.resize_phase.set("fit");
-        self.target.set(Some(natural));
+        self.target.set(Some(fitted));
+
+        // Growing can push a snapped panel off the edge it was snapped to, and
+        // no other size-change path leaves the position unchecked.
+        let clamped = geom::clamp_margins(
+            self.margins.get().left,
+            self.margins.get().top,
+            fitted,
+            self.monitor.get(),
+        );
+        if clamped != self.margins.get() {
+            self.margins.set(clamped);
+            self.apply_margins("fit", fitted, "natural");
+        }
     }
 
     /// Issue at most one size request, called once per frame.
