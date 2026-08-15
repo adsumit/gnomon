@@ -6,7 +6,13 @@ window.gnomon-layer.background {
   background-color: transparent;
 }
 
-/* The runtime probe confirmed every @-name below resolves, so the var(--...)
+/* #root is the SHELL: the outermost box inside the surface, above the
+   ScrolledWindow rather than inside it. That placement is the whole point — the
+   background, border and rounded corners are painted by a widget that always
+   fills the surface, so shrinking the panel can never scroll its own chrome out
+   of view. Everything that scrolls lives below it and carries no styling.
+
+   The runtime probe confirmed every @-name below resolves, so the var(--...)
    tier is gone. The literal before each @-name stays as a last resort: a
    see-through panel is worse than one that ignores the theme.
 
@@ -22,7 +28,9 @@ window.gnomon-layer.background {
 
   border-radius: 16px;
 
-  /* Padding, not margin: the inset must sit inside the rounded background. */
+  /* Padding, not margin: the inset must sit inside the rounded background.
+     fit_to_content reads this back off the widget rather than duplicating the
+     number, so changing it here is enough. */
   padding: 16px;
 }
 
@@ -31,8 +39,9 @@ window.gnomon-layer.background {
   padding: 8px;
 }
 
-/* The ScrolledWindow sits between the overlay and #root purely to decouple the
-   surface size from natural content size. It must not paint over #root. */
+/* The ScrolledWindow sits INSIDE #root and holds the rows. It exists purely to
+   decouple the surface size from natural content size, and must stay invisible
+   so #root's background shows through it. */
 scrolledwindow,
 scrolledwindow > viewport {
   background: none;

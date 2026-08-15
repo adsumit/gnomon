@@ -4,6 +4,7 @@
 //! non-200 maps to [`SourceError::Http`] rather than arriving as a transport
 //! error.
 
+use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::time::Duration;
 
@@ -33,14 +34,42 @@ pub fn extract_cli_version(raw: &str) -> Option<String> {
     }
 }
 
+/// `claude --version`, with the signal mask reset in the child.
+///
+/// A blocked signal mask survives `execve`, and the GUI blocks SIGUSR1 before
+/// anything else so that `--toggle-pin` cannot kill it. Without this, every
+/// process gnomon spawns would inherit that block and run with SIGUSR1
+/// permanently masked — a state `claude` never asked for and cannot detect.
+/// Restoring the default disposition in the child is gnomon's responsibility,
+/// not the child's.
+fn claude_version_command() -> Command {
+    let mut cmd = Command::new("claude");
+    cmd.arg("--version");
+
+    // SAFETY: `pre_exec` runs between fork and exec, where only
+    // async-signal-safe calls are permitted. `sigemptyset`, `sigaddset` and
+    // `pthread_sigmask` are all on the POSIX async-signal-safe list, and
+    // nothing here allocates or takes a lock.
+    unsafe {
+        cmd.pre_exec(|| {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGUSR1);
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+            Ok(())
+        });
+    }
+
+    cmd
+}
+
 /// Build the `User-Agent`, preferring an override, then the CLI, then a constant.
 fn user_agent() -> String {
     let version = std::env::var("GNOMON_CLI_VERSION")
         .ok()
         .filter(|v| !v.is_empty())
         .or_else(|| {
-            Command::new("claude")
-                .arg("--version")
+            claude_version_command()
                 .output()
                 .ok()
                 .and_then(|out| String::from_utf8(out.stdout).ok())

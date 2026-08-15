@@ -52,7 +52,12 @@ pub struct Content {
     /// Called with true when an interactive resize starts and false when it
     /// ends, so the expensive rebuild can be deferred to the end.
     pub set_resizing: Rc<dyn Fn(bool)>,
-    root: gtk::Box,
+    /// The painted container. Fills the surface; owns padding and border.
+    shell: gtk::Box,
+    /// Between the two, unstyled. Its natural size is deliberately suppressed.
+    scrolled: gtk::ScrolledWindow,
+    /// The rows themselves. The only widget that knows how big the data is.
+    content: gtk::Box,
     status: gtk::Label,
     state: Rc<RefCell<State>>,
 }
@@ -126,21 +131,52 @@ impl Content {
         self.state.borrow().loaded
     }
 
-    /// The size the content actually wants, padding included.
+    /// The surface size this panel's content wants, chrome included.
     ///
-    /// Measured on `root`, NOT on the overlay. The ScrolledWindow between them
-    /// carries `propagate_natural_*(false)` precisely so the content's natural
-    /// size cannot act as a floor under an interactive resize — which also
-    /// means asking the widget tree above it for a natural size gets an answer
-    /// that has had the content's own wishes deliberately stripped out. `root`
-    /// is the lowest widget that still knows how big the rows are.
+    /// WHICH WIDGET IS MEASURED, and why it has to be that one. `content` — the
+    /// box holding the rows — is measured directly, on both orientations.
+    /// Nothing above it can answer the question: `scrolled` carries
+    /// `propagate_natural_width(false)` and `propagate_natural_height(false)`,
+    /// whose entire purpose is to stop the child's natural size reaching the
+    /// parent, so measuring the ScrolledWindow, the shell or the window asks the
+    /// one widget in the tree configured to hide the answer. Height is measured
+    /// for the width just measured, because a wrapped label's height depends on
+    /// it.
     ///
-    /// Height is measured for the width we just measured, because a wrapped
-    /// label's height depends on it.
+    /// HOW THE CHROME IS ACCOUNTED FOR. Not from the CSS constants — those would
+    /// be a second copy of the stylesheet, silently wrong the moment either is
+    /// edited, and they change with `.compact`. It is taken from the widgets at
+    /// runtime: `shell` contains only `scrolled`, so the difference between the
+    /// two widgets' natural sizes IS the shell's padding plus border, whatever
+    /// the stylesheet currently says.
     pub fn natural_size(&self) -> (i32, i32) {
-        let (_, width, _, _) = self.root.measure(gtk::Orientation::Horizontal, -1);
-        let (_, height, _, _) = self.root.measure(gtk::Orientation::Vertical, width);
-        (width, height)
+        let (_, width, _, _) = self.content.measure(gtk::Orientation::Horizontal, -1);
+        let (_, height, _, _) = self.content.measure(gtk::Orientation::Vertical, width);
+
+        let (chrome_w, chrome_h) = self.chrome();
+        ((width + chrome_w).max(0), (height + chrome_h).max(0))
+    }
+
+    /// The shell's padding and border, in pixels, on each axis.
+    ///
+    /// `shell` wraps `scrolled` and nothing else, so subtracting the child's
+    /// natural size from the parent's leaves exactly the CSS box it adds. This
+    /// tracks `#root.compact` automatically, which a hardcoded 16 would not.
+    fn chrome(&self) -> (i32, i32) {
+        let (_, shell_w, _, _) = self.shell.measure(gtk::Orientation::Horizontal, -1);
+        let (_, shell_h, _, _) = self.shell.measure(gtk::Orientation::Vertical, -1);
+        let (_, inner_w, _, _) = self.scrolled.measure(gtk::Orientation::Horizontal, -1);
+        let (_, inner_h, _, _) = self.scrolled.measure(gtk::Orientation::Vertical, -1);
+
+        ((shell_w - inner_w).max(0), (shell_h - inner_h).max(0))
+    }
+
+    /// Components of the last fit, for the geometry trace.
+    pub fn fit_breakdown(&self) -> (i32, i32, i32, i32) {
+        let (_, width, _, _) = self.content.measure(gtk::Orientation::Horizontal, -1);
+        let (_, height, _, _) = self.content.measure(gtk::Orientation::Vertical, width);
+        let (chrome_w, chrome_h) = self.chrome();
+        (width, height, chrome_w, chrome_h)
     }
 
     /// Replace the kind list and re-render from the last snapshot.
@@ -272,23 +308,38 @@ impl Content {
     }
 
     fn rerender(&self) {
-        render(&self.root, &self.status, &self.state);
+        render(&self.content, &self.status, &self.state);
     }
 }
 
 /// Build the content tree for one panel.
+///
+/// THE TREE, and why it is this shape:
+///
+/// ```text
+///   overlay          hosts the allocation probe without disturbing layout
+///   └─ shell   #root the PAINTED container: background, border, radius,
+///      │             padding. Always exactly the surface, so the chrome can
+///      │             never be scrolled out of view.
+///      └─ scrolled   unstyled. Carries propagate_natural_*(false) so the
+///         │          content's natural size cannot become a floor under the
+///         │          surface. Clips only the rows.
+///         └─ content the rows. No padding and no name; the shell owns both.
+/// ```
+///
+/// The shell exists because the painted box used to be INSIDE the scrolled
+/// viewport. Whenever the surface was shorter than the content, the viewport
+/// scrolled the painted box's bottom edge — and its rounded corners — out of
+/// sight, so shrinking the panel clipped its chrome rather than just its text.
 pub fn build(kinds: Vec<String>) -> Content {
-    // No widget margins: #root's 16px CSS padding provides the inset *inside*
-    // the painted background. Margins would push the background away from the
-    // surface edge, leaving a dead transparent band around the panel.
-    let root = gtk::Box::builder()
+    // The rows. No widget margins and no padding: inset is the shell's job now.
+    let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(SPACING)
         .build();
-    root.set_widget_name("root");
     // Natural content width must not be a floor, or an edge drag cannot shrink
     // the panel below whatever the labels happen to need.
-    root.set_size_request(0, -1);
+    content.set_size_request(0, -1);
 
     // `max_width_chars` bounds the NATURAL width. Without it a wrapping label
     // reports its natural width as the entire message on one unwrapped line, so
@@ -322,17 +373,26 @@ pub fn build(kinds: Vec<String>) -> Content {
         .propagate_natural_height(false)
         // No momentum panning from a touch drag.
         .kinetic_scrolling(false)
-        .child(&root)
+        .child(&content)
         .build();
 
     block_scrolling(&scrolled);
 
-    let overlay = gtk::Overlay::new();
-    overlay.set_child(Some(&scrolled));
+    // The painted container. It fills the surface, so its border and rounded
+    // corners are always drawn at the surface's own edge.
+    let shell = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .build();
+    shell.set_widget_name("root");
+    shell.set_size_request(0, 0);
+    shell.append(&scrolled);
 
-    render(&root, &status, &state);
-    debug_css_on_realize(&root);
-    let (probe, set_resizing) = watch_width(&overlay, &root, &status, &state);
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&shell));
+
+    render(&content, &status, &state);
+    debug_css_on_realize(&shell);
+    let (probe, set_resizing) = watch_width(&overlay, &shell, &content, &status, &state);
 
     // Countdowns tick locally. This must never touch the network or the socket.
     {
@@ -349,7 +409,9 @@ pub fn build(kinds: Vec<String>) -> Content {
         overlay,
         probe,
         set_resizing,
-        root,
+        shell,
+        scrolled,
+        content,
         status,
         state,
     }
@@ -363,7 +425,8 @@ pub fn build(kinds: Vec<String>) -> Content {
 /// allocation probe without drawing anything.
 fn watch_width(
     overlay: &gtk::Overlay,
-    root: &gtk::Box,
+    shell: &gtk::Box,
+    content: &gtk::Box,
     status: &gtk::Label,
     state: &Rc<RefCell<State>>,
 ) -> (gtk::DrawingArea, Rc<dyn Fn(bool)>) {
@@ -384,7 +447,8 @@ fn watch_width(
     let resizing = Rc::new(Cell::new(false));
 
     {
-        let root_c = root.clone();
+        let shell_c = shell.clone();
+        let content_c = content.clone();
         let status_c = status.clone();
         let state_c = state.clone();
         let last_compact = last_compact.clone();
@@ -399,7 +463,7 @@ fn watch_width(
             // Restyling is cheap, so it stays live during a drag.
             if tight != last_tight.get() {
                 last_tight.set(tight);
-                apply_tight(&root_c, tight);
+                apply_tight(&shell_c, &content_c, tight);
             }
 
             // Rebuilding every widget is not cheap. Mid-drag it is the most
@@ -408,7 +472,7 @@ fn watch_width(
             if !resizing.get() && compact != last_compact.get() {
                 last_compact.set(compact);
                 state_c.borrow_mut().compact = compact;
-                render(&root_c, &status_c, &state_c);
+                render(&content_c, &status_c, &state_c);
             }
         });
     }
@@ -419,7 +483,7 @@ fn watch_width(
     overlay.add_overlay(&probe);
 
     let set_resizing: Rc<dyn Fn(bool)> = {
-        let root_c = root.clone();
+        let content_c = content.clone();
         let status_c = status.clone();
         let state_c = state.clone();
         Rc::new(move |active: bool| {
@@ -432,7 +496,7 @@ fn watch_width(
             if compact != last_compact.get() {
                 last_compact.set(compact);
                 state_c.borrow_mut().compact = compact;
-                render(&root_c, &status_c, &state_c);
+                render(&content_c, &status_c, &state_c);
             }
         })
     };
@@ -441,13 +505,16 @@ fn watch_width(
 }
 
 /// Tightened padding and spacing for a small panel.
-fn apply_tight(root: &gtk::Box, tight: bool) {
+///
+/// Padding belongs to the shell now — it is the painted box — while spacing
+/// between rows belongs to the content box.
+fn apply_tight(shell: &gtk::Box, content: &gtk::Box, tight: bool) {
     if tight {
-        root.add_css_class("compact");
-        root.set_spacing(SPACING_TIGHT);
+        shell.add_css_class("compact");
+        content.set_spacing(SPACING_TIGHT);
     } else {
-        root.remove_css_class("compact");
-        root.set_spacing(SPACING);
+        shell.remove_css_class("compact");
+        content.set_spacing(SPACING);
     }
 }
 
@@ -515,11 +582,11 @@ fn debug_css_on_realize(root: &gtk::Box) {
 }
 
 /// Rebuild the children of `root` from the stored state.
-fn render(root: &gtk::Box, status: &gtk::Label, state: &Rc<RefCell<State>>) {
+fn render(content: &gtk::Box, status: &gtk::Label, state: &Rc<RefCell<State>>) {
     // The probe lives in the overlay, so rebuilding the box's children cannot
     // destroy it.
-    while let Some(child) = root.first_child() {
-        root.remove(&child);
+    while let Some(child) = content.first_child() {
+        content.remove(&child);
     }
 
     let mut rows = Vec::new();
@@ -534,23 +601,23 @@ fn render(root: &gtk::Box, status: &gtk::Label, state: &Rc<RefCell<State>>) {
             .ellipsize(pango::EllipsizeMode::End)
             .build();
         loading.add_css_class("dim-label");
-        root.append(&loading);
+        content.append(&loading);
     } else if windows.is_empty() {
         let empty = gtk::Label::builder()
             .label("No limit windows reported")
             .ellipsize(pango::EllipsizeMode::End)
             .build();
         empty.add_css_class("dim-label");
-        root.append(&empty);
+        content.append(&empty);
     } else {
         for window in &windows {
             let (widget, row) = build_row(window, compact);
-            root.append(&widget);
+            content.append(&widget);
             rows.push(row);
         }
     }
 
-    root.append(status);
+    content.append(status);
     state.borrow_mut().rows = rows;
 }
 

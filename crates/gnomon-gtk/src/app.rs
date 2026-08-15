@@ -44,6 +44,11 @@ pub struct Panel {
     /// is authoritative and nothing re-fits it. Programmatic sizing — the fit
     /// itself — must never set it, or the first fit would disable all the rest.
     user_sized: Cell<bool>,
+    /// Is a gesture in progress on this panel right now?
+    ///
+    /// Auto-fit is suppressed for the whole of it. A poll landing mid-drag
+    /// would otherwise resize the panel out from under the pointer.
+    dragging: Cell<bool>,
 
     // ---- per-window interaction state ----
     pinned: Cell<bool>,
@@ -151,6 +156,7 @@ impl Panel {
             auto_place: Cell::new(false),
             default_size: size,
             user_sized: Cell::new(false),
+            dragging: Cell::new(false),
             pinned: Cell::new(false),
             margins: Cell::new(margins),
             drag_origin: Cell::new(margins),
@@ -333,10 +339,6 @@ impl Panel {
 
     /// Resize from an absolute pointer position.
     fn apply_resize(self: &Rc<Self>, zone: Zone, point: (i32, i32), phase: &'static str) {
-        // The only place this latch is ever set. From here on the panel keeps
-        // the size the user gave it, and a kind-list change no longer re-fits.
-        self.user_sized.set(true);
-
         let (margins, size) = geom::resize_from(
             zone,
             point,
@@ -344,6 +346,14 @@ impl Panel {
             self.resize_origin.get(),
             self.monitor.get(),
         );
+
+        // The only place this latch is ever set, and only when the gesture has
+        // actually changed the size. A bare click inside the 8px resize band
+        // delivers drag events with no real movement, and latching on those
+        // would opt the panel out of auto-fit for good over a pixel of jitter.
+        if size != self.resize_origin.get() {
+            self.user_sized.set(true);
+        }
 
         if margins != self.margins.get() {
             self.margins.set(margins);
@@ -387,6 +397,14 @@ impl Panel {
         if self.user_sized.get() || !self.layered {
             return;
         }
+        // A poll can land at any moment, including mid-gesture. Resizing the
+        // panel under the pointer while the user is dragging it would be the
+        // window moving on its own; `user_sized` does not protect against this
+        // because a MOVE drag never sets it, and even a resize drag has a gap
+        // between drag-begin and its first motion event.
+        if self.dragging.get() {
+            return;
+        }
         // Nothing has been rendered yet, so there is nothing to fit to; sizing
         // to the "Loading usage…" placeholder would only cause a visible jump
         // when the first snapshot lands.
@@ -413,6 +431,7 @@ impl Panel {
 
         self.resize_phase.set("fit");
         self.target.set(Some(fitted));
+        self.debug_fit(fitted);
 
         // Growing can push a snapped panel off the edge it was snapped to, and
         // no other size-change path leaves the position unchecked.
@@ -525,6 +544,28 @@ impl Panel {
             size.0,
             size.1,
             self.content.row_count(),
+        );
+    }
+
+    /// The fit's inputs, so a reported height can be checked against its parts.
+    fn debug_fit(&self, fitted: (i32, i32)) {
+        if std::env::var_os("GNOMON_DEBUG_GEOM").is_none() {
+            return;
+        }
+        let (cw, ch, chrome_w, chrome_h) = self.content.fit_breakdown();
+        eprintln!(
+            "gnomon geom[fit]: rows={} content={cw}x{ch} chrome={chrome_w}x{chrome_h} \
+sum={}x{} fitted={}x{}{}",
+            self.content.row_count(),
+            cw + chrome_w,
+            ch + chrome_h,
+            fitted.0,
+            fitted.1,
+            if fitted != (cw + chrome_w, ch + chrome_h) {
+                "  <-- raised by the 200x100 minimum"
+            } else {
+                ""
+            },
         );
     }
 
@@ -917,6 +958,7 @@ fn wire_drag(panel: &Rc<Panel>) {
     {
         let panel = panel.clone();
         drag.connect_drag_begin(move |_, x, y| {
+            panel.dragging.set(true);
             *panel.drag_target.borrow_mut() = None;
             *panel.drag_row.borrow_mut() = None;
 
@@ -1008,6 +1050,7 @@ fn wire_drag(panel: &Rc<Panel>) {
     {
         let panel = panel.clone();
         drag.connect_drag_end(move |_, dx, dy| {
+            panel.dragging.set(false);
             let zone = panel.drag_zone.get();
             panel.drag_zone.set(Zone::None);
 
@@ -1020,6 +1063,9 @@ fn wire_drag(panel: &Rc<Panel>) {
 
             if zone.is_resize() {
                 (panel.content.set_resizing)(false);
+                // A resize gesture that never changed the size leaves the panel
+                // auto-fitting, and the fits it suppressed can now happen.
+                panel.fit_to_content();
                 return;
             }
             if panel.pinned.get() || !panel.layered {
@@ -1197,6 +1243,7 @@ fn wire_right_button_resize(panel: &Rc<Panel>) {
         let panel = panel.clone();
         drag.connect_drag_begin(move |gesture, x, y| {
             gesture.set_state(gtk::EventSequenceState::Claimed);
+            panel.dragging.set(true);
             panel.grab.set((x, y));
             panel.drag_origin.set(panel.margins.get());
             panel.resize_origin.set(panel.panel_size());
@@ -1217,7 +1264,13 @@ fn wire_right_button_resize(panel: &Rc<Panel>) {
 
     {
         let panel = panel.clone();
-        drag.connect_drag_end(move |_, _, _| (panel.content.set_resizing)(false));
+        drag.connect_drag_end(move |_, _, _| {
+            panel.dragging.set(false);
+            (panel.content.set_resizing)(false);
+            // A resize that ended without changing the size never latched
+            // `user_sized`, so the panel is still auto-fitting: settle it.
+            panel.fit_to_content();
+        });
     }
 
     panel.content.overlay.add_controller(drag);
