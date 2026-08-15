@@ -120,6 +120,29 @@ impl Content {
         self.state.borrow().rows.len()
     }
 
+    /// Has a snapshot ever been rendered? Until it has, there is nothing worth
+    /// sizing the surface to.
+    pub fn is_loaded(&self) -> bool {
+        self.state.borrow().loaded
+    }
+
+    /// The size the content actually wants, padding included.
+    ///
+    /// Measured on `root`, NOT on the overlay. The ScrolledWindow between them
+    /// carries `propagate_natural_*(false)` precisely so the content's natural
+    /// size cannot act as a floor under an interactive resize — which also
+    /// means asking the widget tree above it for a natural size gets an answer
+    /// that has had the content's own wishes deliberately stripped out. `root`
+    /// is the lowest widget that still knows how big the rows are.
+    ///
+    /// Height is measured for the width we just measured, because a wrapped
+    /// label's height depends on it.
+    pub fn natural_size(&self) -> (i32, i32) {
+        let (_, width, _, _) = self.root.measure(gtk::Orientation::Horizontal, -1);
+        let (_, height, _, _) = self.root.measure(gtk::Orientation::Vertical, width);
+        (width, height)
+    }
+
     /// Replace the kind list and re-render from the last snapshot.
     pub fn set_kinds(&self, kinds: Vec<String>) {
         {

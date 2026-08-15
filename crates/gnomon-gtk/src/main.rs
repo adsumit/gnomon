@@ -31,6 +31,16 @@ EXIT CODES:
     2  auth expired or invalid";
 
 fn main() -> ExitCode {
+    // FIRST. Nothing may precede this — not argument parsing, not a GTK call,
+    // not the construction of adw::Application. `pthread_sigmask` only ever
+    // sets the calling thread's mask, and threads inherit it at creation, so a
+    // thread that already exists can never be retrofitted. GTK, GLib, GDBus and
+    // GSK all start worker pools during initialisation; any one of them left
+    // unblocked will accept a process-directed SIGUSR1, and the default
+    // disposition for SIGUSR1 is to kill the process. Blocking it here, in
+    // every mode, is what makes --toggle-pin a toggle rather than a kill.
+    pin::block_sigusr1();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flags: Vec<&str> = args.iter().map(String::as_str).collect();
 

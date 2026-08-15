@@ -36,6 +36,14 @@ pub struct Panel {
     /// panels are placed explicitly by the tear.
     auto_place: Cell<bool>,
     default_size: (i32, i32),
+    /// Has the user ever resized THIS panel by hand?
+    ///
+    /// Latched by the first interactive resize and never cleared. It is the
+    /// whole difference between the two sizing rules: until it is set the
+    /// surface follows its content, and once it is set the size the user chose
+    /// is authoritative and nothing re-fits it. Programmatic sizing — the fit
+    /// itself — must never set it, or the first fit would disable all the rest.
+    user_sized: Cell<bool>,
 
     // ---- per-window interaction state ----
     pinned: Cell<bool>,
@@ -142,6 +150,7 @@ impl Panel {
             monitor: Cell::new((0, 0)),
             auto_place: Cell::new(false),
             default_size: size,
+            user_sized: Cell::new(false),
             pinned: Cell::new(false),
             margins: Cell::new(margins),
             drag_origin: Cell::new(margins),
@@ -324,6 +333,10 @@ impl Panel {
 
     /// Resize from an absolute pointer position.
     fn apply_resize(self: &Rc<Self>, zone: Zone, point: (i32, i32), phase: &'static str) {
+        // The only place this latch is ever set. From here on the panel keeps
+        // the size the user gave it, and a kind-list change no longer re-fits.
+        self.user_sized.set(true);
+
         let (margins, size) = geom::resize_from(
             zone,
             point,
@@ -352,6 +365,42 @@ impl Panel {
         );
         self.margins.set(moved);
         self.apply_margins("drag", self.panel_size(), "allocated");
+    }
+
+    /// Shrink or grow the surface to whatever the content now needs.
+    ///
+    /// HOW THE SURFACE ACTUALLY SHRINKS. There is no "unset the size" lever
+    /// here: the ScrolledWindow's `propagate_natural_*(false)` means GTK's own
+    /// negotiation can never learn the content's size, which is exactly what
+    /// stops natural size acting as a floor under an interactive resize. So the
+    /// content is measured explicitly and the answer is pushed back through the
+    /// SAME path a drag uses — `target`, then one `set_default_size` per frame
+    /// from `tick_resize`. `set_default_size` is a request, not a minimum, so a
+    /// smaller number really does shrink the layer surface.
+    ///
+    /// Reusing the drag path also inherits its protections for free: the
+    /// one-in-flight gate, the equality escape that skips a size the surface
+    /// already has, and the eight-frame timeout.
+    fn fit_to_content(self: &Rc<Self>) {
+        // The user's chosen size is authoritative. This is the guard that keeps
+        // M4's resize behaviour untouched.
+        if self.user_sized.get() || !self.layered {
+            return;
+        }
+        // Nothing has been rendered yet, so there is nothing to fit to; sizing
+        // to the "Loading usage…" placeholder would only cause a visible jump
+        // when the first snapshot lands.
+        if !self.content.is_loaded() {
+            return;
+        }
+
+        let natural = self.content.natural_size();
+        if natural.0 <= 0 || natural.1 <= 0 {
+            return;
+        }
+
+        self.resize_phase.set("fit");
+        self.target.set(Some(natural));
     }
 
     /// Issue at most one size request, called once per frame.
@@ -416,6 +465,22 @@ impl Panel {
         if self.trace_next_alloc.replace(false) {
             self.debug_source("tear-source-alloc", &format!("allocated={width}x{height}"));
         }
+
+        // An allocation is also how the responsive modes change: window.rs
+        // connected its own handler to this probe FIRST, so by the time we get
+        // here it has already decided compact/tight and re-rendered. Entering
+        // compact hides the countdowns and tightens the padding, which shortens
+        // the content — and without a re-fit that shortening reappears as dead
+        // space, the exact defect this rule exists to remove.
+        //
+        // This cannot spin. The fit measures, and `tick_resize`'s equality
+        // escape drops any target the surface already has, so a fit that finds
+        // an unchanged natural size issues no request and produces no further
+        // allocation. When the size HAS changed, the responsive thresholds have
+        // separate enter and exit values, so a shrink can never re-cross the
+        // boundary it just crossed: the sequence normal -> compact -> tight is
+        // one-way and at most two steps long.
+        self.fit_to_content();
     }
 
     /// One line of this panel's position and size, for watching a tear.
@@ -591,6 +656,9 @@ impl Layout {
     fn add(self: &Rc<Self>, panel: Rc<Panel>) {
         self.panels.borrow_mut().push(panel.clone());
         panel.win.present();
+        // A torn-off panel is seeded with the cached snapshot, so it already
+        // knows its one row and can size to it on the first frame.
+        panel.fit_to_content();
     }
 
     fn remove(self: &Rc<Self>, panel: &Rc<Panel>) {
@@ -614,6 +682,9 @@ impl Layout {
 
                 for panel in &panels {
                     panel.content.apply_snapshot(&snapshot);
+                    // The rows may have changed shape, and a panel the user has
+                    // not sized follows them.
+                    panel.fit_to_content();
                 }
             }
             Update::Error(message) => {
@@ -671,6 +742,10 @@ impl Layout {
             None => false,
         };
 
+        // The survivor gained rows; if it is not user-sized it grows to hold
+        // them rather than scrolling them out of sight.
+        into.fit_to_content();
+
         self.remove(dragged);
 
         if std::env::var_os("GNOMON_DEBUG_GEOM").is_some() {
@@ -706,7 +781,12 @@ impl Layout {
 pub fn run(toplevel: bool) -> glib::ExitCode {
     let app = adw::Application::builder().application_id(APP_ID).build();
 
-    app.connect_startup(|_| load_css());
+    app.connect_startup(|_| {
+        // First point at which GTK is initialised, so this is where its worker
+        // threads exist to be checked.
+        pin::verify_sigusr1_blocked("GTK startup");
+        load_css();
+    });
     app.connect_activate(move |app| build_layout(app, toplevel));
     app.connect_shutdown(|_| pin::remove_pid_file());
 
@@ -735,9 +815,15 @@ fn load_css() {
 }
 
 fn build_layout(app: &adw::Application, toplevel: bool) {
-    // Before any other thread exists, so they all inherit the blocked mask.
+    // The MASK is installed in main(), before any library can spawn a thread.
+    // Only the sigwait thread is created here, and it can be created at any
+    // time — it inherits the mask like everything else.
     let (sig_tx, sig_rx) = async_channel::unbounded::<()>();
     pin::watch_sigusr1(sig_tx);
+
+    // The surface exists by now, so the render thread GSK spawns lazily is
+    // included in this sweep as well.
+    pin::verify_sigusr1_blocked("layout construction");
 
     let layout = Layout::new(app, toplevel);
     layout.spawn_initial();
@@ -996,8 +1082,17 @@ fn tear_off(panel: &Rc<Panel>, kind: &str, dx: f64, dy: f64) -> Option<Rc<Panel>
     panel.trace_next_alloc.set(true);
     panel.trace_next_request.set(true);
 
+    // The source has one fewer row. If it is not user-sized it closes the gap
+    // that row left behind rather than keeping the hole.
+    panel.fit_to_content();
+
     let new_panel = Panel::new(&layout, vec![kind.to_string()], placed, size);
     new_panel.monitor.set(panel.monitor.get());
+
+    // The source's size is inherited only if the source's size was a decision.
+    // Otherwise `size` is merely a provisional value that avoids a zero-sized
+    // flash, and `Layout::add` immediately fits the new panel to its one row.
+    new_panel.user_sized.set(panel.user_sized.get());
 
     // Back-date the origin so `origin + cumulative offset` lands on `placed`
     // right now, and tracks the pointer from here on.
