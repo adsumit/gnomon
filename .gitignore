@@ -4,3 +4,4 @@
 *.log
 bridge.token
 crates/gnomon-core/tests/fixtures/live_oauth.raw.json
+.claude/
