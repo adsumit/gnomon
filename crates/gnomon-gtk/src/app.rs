@@ -216,8 +216,16 @@ impl Panel {
 
     /// Monitor geometry, and — for the first panel only — its position.
     fn on_realize(self: &Rc<Self>, win: &adw::ApplicationWindow) {
-        let monitor = monitor_size(win);
-        self.monitor.set(monitor);
+        // Only overwrite with a real answer. A torn-off panel inherits its
+        // source's monitor before being presented, and clobbering that with the
+        // (0, 0) that `monitor_size` returns when it cannot identify an output
+        // would throw away the one good value we had.
+        let mut monitor = monitor_size(win);
+        if monitor.0 > 0 && monitor.1 > 0 {
+            self.monitor.set(monitor);
+        } else {
+            monitor = self.monitor.get();
+        }
 
         if self.layered && self.auto_place.get() {
             // Deliberately NOT panel_size(): at realize the window has not been
@@ -633,16 +641,14 @@ impl Layout {
     /// The stationary panel absorbs the dragged one, keeping its own position,
     /// size and pin state. The dragged window is destroyed.
     fn merge(self: &Rc<Self>, dragged: &Rc<Panel>, into: &Rc<Panel>) {
+        // `absorb` re-renders from the survivor's own copy of the last
+        // snapshot, and that copy is always current: every panel is seeded at
+        // construction and fed by every dispatch, so `all` holds the same
+        // snapshot the cache does. Re-applying the cache here would therefore
+        // be a no-op on the rows — and NOT a no-op overall, because the
+        // unchanged path in `apply_snapshot` hides the status label, which
+        // would silently wipe an error banner the survivor is displaying.
         into.content.absorb(dragged.content.kinds());
-
-        // `absorb` re-filters from the survivor's own copy of the last
-        // snapshot, which the construction-time seeding guarantees is present.
-        // Re-applying the cache here is what makes that a guarantee rather than
-        // an assumption: if the survivor's copy is already current this is a
-        // no-op, and if it somehow is not, the absorbed rows still render.
-        if let Some(snapshot) = self.last_snapshot.borrow().as_ref() {
-            into.content.apply_snapshot(snapshot);
-        }
 
         self.remove(dragged);
 
@@ -776,6 +782,12 @@ fn wire_drag(panel: &Rc<Panel>) {
         drag.connect_drag_begin(move |_, x, y| {
             *panel.drag_target.borrow_mut() = None;
             *panel.drag_row.borrow_mut() = None;
+
+            // A new gesture ends the observation window opened by any previous
+            // tear. Without this a request minutes later would still print
+            // under the tear label and read as a consequence of the tear.
+            panel.trace_next_alloc.set(false);
+            panel.trace_next_request.set(false);
 
             if panel.pinned.get() {
                 panel.drag_zone.set(Zone::None);

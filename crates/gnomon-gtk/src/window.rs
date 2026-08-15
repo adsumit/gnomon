@@ -68,6 +68,24 @@ fn visible(kinds: &[String], all: &[LimitWindow]) -> Vec<LimitWindow> {
         .collect()
 }
 
+/// Does a freshly filtered set replace what is on screen?
+///
+/// Three cases, and the first is the one a torn-off panel depends on. A panel
+/// that has never loaded ALWAYS takes the new set, even an empty one, because
+/// taking it is what clears the "Loading usage…" placeholder — so seeding a new
+/// panel from the cached snapshot is guaranteed to get it off that placeholder.
+///
+/// A panel that has loaded keeps its rows when the new set is empty: "nothing
+/// to say about these kinds" is not "these kinds are gone". Otherwise it takes
+/// the new set only when it genuinely differs, which is what makes an unchanged
+/// poll free.
+fn takes_snapshot(loaded: bool, current: &[LimitWindow], next: &[LimitWindow]) -> bool {
+    if !loaded {
+        return true;
+    }
+    !next.is_empty() && current != next
+}
+
 impl Content {
     /// Kinds this panel renders. Empty means "everything".
     pub fn kinds(&self) -> Vec<String> {
@@ -158,17 +176,12 @@ impl Content {
 
             let next = visible(&s.kinds, &s.all);
 
-            // Two distinct reasons to leave the rows alone, both no-ops:
-            // nothing in this snapshot concerns us, or nothing changed.
-            let nothing_for_us = next.is_empty() && s.loaded;
-            let unchanged = s.loaded && s.windows == next;
-
-            if nothing_for_us || unchanged {
-                false
-            } else {
+            if takes_snapshot(s.loaded, &s.windows, &next) {
                 s.windows = next;
                 s.loaded = true;
                 true
+            } else {
+                false
             }
         };
 
@@ -547,5 +560,88 @@ pub fn countdown(resets_at: Option<DateTime<Utc>>) -> String {
         format!("resets in {hours}h {mins}m")
     } else {
         format!("resets in {mins}m")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gnomon_core::WindowSource;
+
+    fn window(kind: &str, percent: f64) -> LimitWindow {
+        LimitWindow {
+            kind: kind.to_string(),
+            group: "g".to_string(),
+            percent,
+            severity: None,
+            resets_at: None,
+            scope: None,
+            is_active: None,
+            source: WindowSource::Api,
+        }
+    }
+
+    fn all() -> Vec<LimitWindow> {
+        vec![window("five_hour", 12.0), window("seven_day", 40.0)]
+    }
+
+    // ---- kind filtering ----
+
+    #[test]
+    fn an_empty_kind_list_is_the_wildcard() {
+        assert_eq!(visible(&[], &all()), all());
+    }
+
+    #[test]
+    fn a_kind_list_selects_only_its_own_kinds() {
+        let kinds = vec!["seven_day".to_string()];
+        assert_eq!(visible(&kinds, &all()), vec![window("seven_day", 40.0)]);
+    }
+
+    #[test]
+    fn filtering_preserves_snapshot_order_not_kind_list_order() {
+        let kinds = vec!["seven_day".to_string(), "five_hour".to_string()];
+        assert_eq!(visible(&kinds, &all()), all());
+    }
+
+    #[test]
+    fn a_kind_absent_from_the_snapshot_yields_nothing() {
+        let kinds = vec!["not_a_real_kind".to_string()];
+        assert!(visible(&kinds, &all()).is_empty());
+    }
+
+    // ---- the seeding decision ----
+    //
+    // The first two pin defect A: a panel torn off between polls is seeded from
+    // the cached snapshot, and that seed must always get it off the loading
+    // placeholder.
+
+    #[test]
+    fn an_unloaded_panel_always_takes_the_snapshot() {
+        assert!(takes_snapshot(false, &[], &all()));
+    }
+
+    #[test]
+    fn an_unloaded_panel_takes_even_an_empty_snapshot() {
+        // Otherwise `loaded` never flips and the panel shows "Loading usage…"
+        // forever, which is exactly the defect.
+        assert!(takes_snapshot(false, &[], &[]));
+    }
+
+    #[test]
+    fn a_loaded_panel_ignores_an_identical_snapshot() {
+        assert!(!takes_snapshot(true, &all(), &all()));
+    }
+
+    #[test]
+    fn a_loaded_panel_takes_a_changed_snapshot() {
+        let next = vec![window("five_hour", 13.0), window("seven_day", 40.0)];
+        assert!(takes_snapshot(true, &all(), &next));
+    }
+
+    #[test]
+    fn a_loaded_panel_keeps_its_rows_when_the_snapshot_says_nothing_about_them() {
+        // Empty means "no news about these kinds", not "these kinds are gone".
+        assert!(!takes_snapshot(true, &all(), &[]));
     }
 }
