@@ -422,6 +422,48 @@ suppressed by design, so it must carry hexpand and vexpand to receive any."
 
         let measured = self.natural_size();
         self.state.borrow_mut().natural = Some(measured);
+
+        // Put the latches back, from the size the surface ACTUALLY has.
+        //
+        // Clearing them above is required to get an honest measurement, but
+        // leaving them cleared was a regression: the only other place they are
+        // derived is the probe's `resize` signal, which fires when the SURFACE
+        // changes size — and a snapshot that changes the rows of a user-sized
+        // panel changes no surface size at all. Every poll therefore knocked a
+        // small panel out of compact and tight permanently, and its content
+        // began overflowing at full padding.
+        self.rederive_responsive(measured);
+    }
+
+    /// Recompute compact/tight against the current allocation and apply them.
+    ///
+    /// Uses plain `render`, never `remeasure_natural`, so it cannot move the
+    /// yardstick it was just handed — which is what keeps this off the feedback
+    /// path that the absolute thresholds used to create.
+    fn rederive_responsive(&self, natural: (i32, i32)) {
+        let allocated = (self.shell.width(), self.shell.height());
+        if allocated.0 <= 0 || allocated.1 <= 0 {
+            // Never allocated yet. The first real allocation will drive the
+            // probe, which derives them the usual way.
+            return;
+        }
+
+        let (compact, tight) = geom::responsive_state(
+            allocated,
+            natural,
+            geom::RESPONSIVE_BAND,
+            false,
+            false,
+        );
+
+        if tight {
+            self.state.borrow_mut().tight = true;
+            apply_tight(&self.shell, &self.content, true);
+        }
+        if compact {
+            self.state.borrow_mut().compact = true;
+            render(&self.content, &self.status, &self.state);
+        }
     }
 
     /// The cached natural size, if one has been measured.

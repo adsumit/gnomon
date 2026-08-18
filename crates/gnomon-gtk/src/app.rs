@@ -441,7 +441,7 @@ impl Panel {
 
         self.resize_phase.set("fit");
         self.target.set(Some(fitted));
-        self.debug_fit(fitted);
+        self.debug_fit(natural, fitted);
 
         // Growing can push a snapped panel off the edge it was snapped to, and
         // no other size-change path leaves the position unchecked.
@@ -562,20 +562,30 @@ impl Panel {
     }
 
     /// The fit's inputs, so a reported height can be checked against its parts.
-    fn debug_fit(&self, fitted: (i32, i32)) {
+    ///
+    /// `content`/`chrome` are a LIVE measurement and therefore reflect whatever
+    /// responsive mode is active right now; `natural` is the cached yardstick,
+    /// measured with both modes off, and is what the fit actually used. The two
+    /// legitimately differ whenever the panel is compact — so the monitor-cap
+    /// marker compares `fitted` against `natural`, never against the live sum.
+    /// Comparing against the live sum printed "capped by the monitor" on a
+    /// monitor that had capped nothing.
+    fn debug_fit(&self, natural: (i32, i32), fitted: (i32, i32)) {
         if std::env::var_os("GNOMON_DEBUG_GEOM").is_none() {
             return;
         }
         let (cw, ch, chrome_w, chrome_h) = self.content.fit_breakdown();
         eprintln!(
             "gnomon geom[fit]: rows={} content={cw}x{ch} chrome={chrome_w}x{chrome_h} \
-sum={}x{} fitted={}x{}{}",
-            self.content.row_count(),
+live={}x{} natural={}x{} fitted={}x{}{}",
             cw + chrome_w,
             ch + chrome_h,
+            natural.0,
+            natural.1,
             fitted.0,
             fitted.1,
-            if fitted != (cw + chrome_w, ch + chrome_h) {
+            self.content.row_count(),
+            if fitted != natural {
                 "  <-- capped by the monitor"
             } else {
                 ""
